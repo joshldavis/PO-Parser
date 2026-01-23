@@ -1,89 +1,105 @@
 import * as XLSX from "xlsx";
 import { POLineRow } from "../types";
+import { CONTROL_SURFACE_HEADERS, toControlSurfaceRecord } from "./controlSurfaceExport";
 
 type ControlSurfaceRow = Record<string, any>;
 
+const REQUIRED_AUDIT_COLUMNS = [
+  "policy_version_applied",
+  "policy_rule_ids_applied",
+  "routing_reason",
+] as const;
+
+function normalizePolicyRuleIds(v: unknown): string {
+  if (!v) return "";
+  if (Array.isArray(v)) return v.join(",");
+  return String(v);
+}
+
 /**
- * Convert POLineRow[] to the exact columns expected by the enterprise analysis tool.
+ * Map POLineRow[] -> row objects keyed by worksheet headers.
+ * Combines standard Control Surface fields with enterprise audit metadata.
  */
 function mapToControlSurfaceRows(rows: POLineRow[]): ControlSurfaceRow[] {
   return rows.map((r) => {
-    // Collect flags from restored properties
-    const flags = [r.edge_case_flag_1, r.edge_case_flag_2, r.edge_case_flag_3]
-      .filter(Boolean)
-      .join(";");
-
-    // Calculate confidence score using restored field or fallback to match_score
-    const confidencePct = typeof r.confidence_score === "number"
-      ? Math.round(r.confidence_score * 100)
-      : (typeof r.match_score === "number" ? Math.round(r.match_score * 100) : "");
-
+    const rec = toControlSurfaceRecord(r);
+    
     return {
-      doc_id: r.doc_id ?? "",
-      doc_type: r.doc_type ?? "UNKNOWN",
-      customer_name: r.customer_name ?? "",
-      customer_order_no: r.customer_po_number ?? "",
-      abh_order_no: "", 
-      document_date: r.doc_date ?? "",
-      ship_to_address_raw: r.ship_to_address_raw ?? "",
-      bill_to_address_raw: r.bill_to_address_raw ?? "",
-      mark_instructions: r.mark_instructions ?? "",
-      line_no: r.line_no ?? "",
-      customer_item_no: r.customer_item_no ?? "",
-      customer_item_desc_raw: r.description_raw ?? "",
-      qty: r.quantity ?? "",
-      uom: r.uom_raw ?? "",
-      unit_price: r.unit_price ?? "",
-      extended_price: r.extended_price ?? "",
-      abh_item_no_candidate: r.sage_item_no ?? "",
-      item_class: r.item_class ?? "UNKNOWN",
-      edge_case_flags: flags,
-      confidence_score: confidencePct,
-      automation_lane: r.automation_lane ?? "ASSIST",
-      deterministic_rule_exists: r.deterministic_rule_exists ?? (r.automation_lane === "AUTO" ? "Y" : ""),
-      phase_target: r.phase_target ?? "",
-      fields_requiring_review: r.fields_requiring_review ?? (r.sage_blockers || []).join(";"),
-      routing_reason: r.routing_reason ?? r.needs_review_reason ?? "",
-      final_abh_item_no: r.sage_item_no ?? "",
+      ...rec,
+      // Ensure these keys match the REQUIRED_AUDIT_COLUMNS strings
+      policy_version_applied: r.policy_version_applied ?? "",
+      policy_rule_ids_applied: normalizePolicyRuleIds(r.policy_rule_ids_applied),
+      routing_reason: r.routing_reason ?? rec.routing_reason ?? "",
     };
   });
 }
 
 /**
- * Export rows into an XLSX workbook. If a template is provided, it tries to map to a specific sheet.
+ * Ensure required audit columns exist in the header row.
+ * If missing, append them to the end (non-breaking).
  */
+function ensureHeaders(headers: string[]): string[] {
+  const set = new Set(headers.map((h) => String(h).trim()));
+  const out = [...headers];
+
+  for (const col of REQUIRED_AUDIT_COLUMNS) {
+    if (!set.has(col)) out.push(col);
+  }
+  return out;
+}
+
 export function buildControlSurfaceWorkbook(args: {
   templateArrayBuffer?: ArrayBuffer;
   poLineRows: POLineRow[];
 }): Blob {
   const { templateArrayBuffer, poLineRows } = args;
+  const sheetName = "PO_LineItem_Analysis";
 
   let wb: XLSX.WorkBook;
-  const sheetName = "PO_LineItem_Analysis";
+  let headers: string[];
 
   if (templateArrayBuffer) {
     wb = XLSX.read(templateArrayBuffer, { type: "array" });
     const ws = wb.Sheets[sheetName];
-    
-    // If template has headers, we respect them
-    const mapped = mapToControlSurfaceRows(poLineRows);
-    const existingHeaderAOA = ws ? XLSX.utils.sheet_to_json<any[]>(ws, { header: 1 }) : [];
-    const headers = existingHeaderAOA[0] || (mapped.length > 0 ? Object.keys(mapped[0]) : []);
-    
-    const aoa = [
-      headers,
-      ...mapped.map(row => headers.map(h => row[h] ?? ""))
-    ];
-    
-    wb.Sheets[sheetName] = XLSX.utils.aoa_to_sheet(aoa);
+    if (!ws) throw new Error(`Template missing sheet: ${sheetName}`);
+
+    // Read header row from template (Row 18 is the typical start, but let's find the headers)
+    // We assume row 1 for finding existing headers if it's a raw template, 
+    // or row 18 if it's the complex ABH template.
+    const headerAOA = XLSX.utils.sheet_to_json<any[]>(ws, {
+      header: 1,
+      range: 0,
+      blankrows: false,
+    }) as any[][];
+
+    const rawHeaders: string[] = (headerAOA?.[0] ?? []).map((h: any) => String(h || "").trim());
+    if (!rawHeaders.length) {
+       // Fallback to standard headers if we can't read them
+       headers = ensureHeaders([...CONTROL_SURFACE_HEADERS]);
+    } else {
+       headers = ensureHeaders(rawHeaders);
+    }
   } else {
+    // NO TEMPLATE: Create from scratch
     wb = XLSX.utils.book_new();
-    const mapped = mapToControlSurfaceRows(poLineRows);
-    const ws = XLSX.utils.json_to_sheet(mapped);
-    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    headers = ensureHeaders([...CONTROL_SURFACE_HEADERS]);
+  }
+
+  // Build AOAs in header order
+  const mapped = mapToControlSurfaceRows(poLineRows);
+  const dataAOA: any[][] = mapped.map((rowObj) => headers.map((h) => (rowObj[h] ?? "")));
+
+  const finalAOA: any[][] = [headers, ...dataAOA];
+
+  // Create/Replace sheet
+  const newWs = XLSX.utils.aoa_to_sheet(finalAOA);
+  wb.Sheets[sheetName] = newWs;
+  if (!wb.SheetNames.includes(sheetName)) {
+    wb.SheetNames.push(sheetName);
   }
 
   const out = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+
   return new Blob([out], {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   });

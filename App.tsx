@@ -1,71 +1,70 @@
-
-import React, { useState, useCallback, useRef } from 'react';
-import { OrderLineItem, GeminiParsingResult, DocumentType, DocumentData } from './types';
+import React, { useState, useRef } from 'react';
+import { POLineRow, GeminiParsingResult } from './types';
 import { parseDocument } from './services/geminiService';
+import { geminiResultToPOLineRows, applyPhase1Routing, rowsToCsv, downloadCsv } from './services/mappingService';
+import { buildControlSurfaceWorkbook, downloadBlob } from './services/xlsxExport';
 import DataTable from './components/DataTable';
 
+declare const Tesseract: any;
+
 const App: React.FC = () => {
-  const [data, setData] = useState<OrderLineItem[]>([]);
+  const [rows, setRows] = useState<POLineRow[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStatus, setProcessingStatus] = useState<string>('');
   const [progress, setProgress] = useState(0);
+  const [controlTemplateFile, setControlTemplateFile] = useState<File | null>(null);
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const templateInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
 
     setIsProcessing(true);
-    const newItems: OrderLineItem[] = [];
+    let allNewRows: POLineRow[] = [];
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      setProgress(Math.round(((i) / files.length) * 100));
+      const fileStem = file.name.replace(/\.[^/.]+$/, "");
+      const stepSize = 100 / files.length;
+      const baseProgress = (i / files.length) * 100;
 
       try {
+        let ocrTextHint = '';
+        if (file.type.startsWith('image/')) {
+          setProcessingStatus(`OCR analyzing: ${file.name}...`);
+          setProgress(baseProgress + (stepSize * 0.3));
+          const result = await Tesseract.recognize(file, 'eng');
+          ocrTextHint = result.data.text;
+        }
+
+        setProcessingStatus(`Gemini extracting: ${file.name}...`);
+        setProgress(baseProgress + (stepSize * 0.7));
+
         const base64 = await fileToBase64(file);
-        const result: GeminiParsingResult = await parseDocument(base64, file.type);
+        const parsed: GeminiParsingResult = await parseDocument(base64, file.type, ocrTextHint);
         
-        // Process each document found in the file (e.g., multiple pages)
-        result.documents.forEach((doc: DocumentData) => {
-          const flattenedItems: OrderLineItem[] = doc.lineItems.map((line, index) => {
-            const qty = line.quantityOrdered || 0;
-            const price = line.unitPrice || 0;
-            const total = line.totalAmount || (qty * price);
-
-            return {
-              id: `${file.name}-${doc.orderNumber}-${doc.documentType}-${index}-${Date.now()}`,
-              sourceFile: file.name,
-              documentType: doc.documentType || DocumentType.UNKNOWN,
-              orderNumber: doc.orderNumber || 'N/A',
-              orderDate: doc.orderDate || 'N/A',
-              customerName: doc.customerName || 'N/A',
-              vendorName: doc.vendorName || 'N/A',
-              customerPO: doc.customerPO || '',
-              currency: doc.currency || 'USD',
-              itemNumber: line.itemNumber || 'N/A',
-              description: line.description || '',
-              unit: line.unit || '',
-              quantityOrdered: qty,
-              quantityShipped: line.quantityShipped || 0,
-              unitPrice: price,
-              totalAmount: total,
-            };
-          });
-
-          newItems.push(...flattenedItems);
+        const rows0 = geminiResultToPOLineRows({ 
+          parsed, 
+          sourceFileStem: fileStem 
         });
 
+        const routedRows = applyPhase1Routing(rows0);
+        allNewRows = [...allNewRows, ...routedRows];
+
       } catch (error) {
-        console.error(`Error parsing ${file.name}:`, error);
-        alert(`Failed to parse ${file.name}. Please check the console for details.`);
+        console.error(`Error processing ${file.name}:`, error);
+        alert(`Could not process ${file.name}. Ensure file is a valid PDF or Image.`);
       }
       
       setProgress(Math.round(((i + 1) / files.length) * 100));
     }
 
-    setData(prev => [...newItems, ...prev]);
+    setRows(prev => [...allNewRows, ...prev]);
     setIsProcessing(false);
     setProgress(0);
+    setProcessingStatus('');
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -76,214 +75,204 @@ const App: React.FC = () => {
       reader.onload = () => {
         const base64String = reader.result?.toString().split(',')[1];
         if (base64String) resolve(base64String);
-        else reject(new Error("Failed to convert file to base64"));
+        else reject(new Error("Base64 conversion failed"));
       };
       reader.onerror = error => reject(error);
     });
   };
 
-  const exportToCSV = () => {
-    if (data.length === 0) return;
-
-    const headers = [
-      "Document Type", "Order Number", "Order Date", "Customer", "Vendor", "Customer PO",
-      "Item Number", "Description", "Unit", "Qty Ordered", "Qty Shipped", "Unit Price", "Total", "Currency", "Source File"
-    ];
-
-    const rows = data.map(item => [
-      `"${item.documentType}"`,
-      `"${item.orderNumber}"`,
-      `"${item.orderDate}"`,
-      `"${item.customerName}"`,
-      `"${item.vendorName}"`,
-      `"${item.customerPO}"`,
-      `"${item.itemNumber}"`,
-      `"${item.description.replace(/"/g, '""')}"`,
-      `"${item.unit}"`,
-      item.quantityOrdered,
-      item.quantityShipped,
-      item.unitPrice,
-      item.totalAmount,
-      `"${item.currency}"`,
-      `"${item.sourceFile}"`
-    ]);
-
-    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    const url = URL.createObjectURL(blob);
-    link.setAttribute('href', url);
-    link.setAttribute('download', `orders_export_${new Date().toISOString().split('T')[0]}.csv`);
-    link.style.visibility = 'hidden';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+  const handleExportCSV = () => {
+    if (rows.length === 0) return;
+    const csv = rowsToCsv(rows);
+    const filename = `OrderFlow_Export_${new Date().getTime()}.csv`;
+    downloadCsv(filename, csv);
   };
 
-  const deleteItem = (id: string) => {
-    setData(prev => prev.filter(item => item.id !== id));
+  const handleExportControlSurfaceXlsx = async () => {
+    if (rows.length === 0) return;
+    if (!controlTemplateFile) {
+      alert("Please upload a 'Control Surface' template file (.xlsx) first.");
+      templateInputRef.current?.click();
+      return;
+    }
+    
+    try {
+      const buf = await controlTemplateFile.arrayBuffer();
+      const blob = buildControlSurfaceWorkbook({
+        templateArrayBuffer: buf,
+        poLineRows: rows,
+      });
+
+      downloadBlob(`OrderFlow_ControlSurface_${new Date().getTime()}.xlsx`, blob);
+    } catch (err: any) {
+      alert("Export failed: " + err.message);
+    }
+  };
+
+  const deleteRow = (index: number) => {
+    setRows(prev => prev.filter((_, i) => i !== index));
   };
 
   const clearAll = () => {
-    if (confirm("Are you sure you want to clear all data?")) {
-      setData([]);
+    if (confirm("Clear all extracted lines from memory?")) {
+      setRows([]);
     }
   };
 
   return (
-    <div className="min-h-screen flex flex-col">
-      {/* Header */}
-      <header className="bg-white border-b border-gray-200 sticky top-0 z-30">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-2">
-            <div className="bg-blue-600 p-2 rounded-lg">
-              <i className="fa-solid fa-file-invoice text-white text-xl"></i>
+    <div className="min-h-screen bg-slate-50 flex flex-col antialiased text-slate-900">
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-40 shadow-sm backdrop-blur-md bg-white/80">
+        <div className="max-w-7xl mx-auto px-6 py-4 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <div className="bg-gradient-to-tr from-blue-600 to-indigo-700 p-2.5 rounded-2xl shadow-xl shadow-blue-500/20">
+              <i className="fa-solid fa-file-invoice text-white text-2xl"></i>
             </div>
             <div>
-              <h1 className="text-xl font-bold text-gray-900 leading-tight">OrderFlow <span className="text-blue-600">Parser</span></h1>
-              <p className="text-xs text-gray-500">AI-Powered Order Data Extraction</p>
+              <h1 className="text-2xl font-black tracking-tight leading-none">OrderFlow <span className="text-blue-600">Pro</span></h1>
+              <div className="flex items-center gap-2 mt-1">
+                 <span className="text-[10px] bg-slate-900 text-white px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">Enterprise v3</span>
+                 <p className="text-[11px] text-slate-400 font-medium">Advanced Data Pipeline</p>
+              </div>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
+            {/* Template Selection */}
+            <div className="hidden lg:flex flex-col items-end mr-4 bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-xl shadow-inner">
+               <span className="text-[9px] font-black text-slate-400 uppercase mb-1 tracking-widest">Active Template</span>
+               <button 
+                 onClick={() => templateInputRef.current?.click()}
+                 className={`text-[11px] font-bold transition-all flex items-center gap-2 px-2 py-0.5 rounded-lg ${controlTemplateFile ? 'text-emerald-700 bg-emerald-50 border border-emerald-100' : 'text-blue-600 bg-blue-50 border border-blue-100 hover:bg-blue-100'}`}
+               >
+                 <i className={`fa-solid ${controlTemplateFile ? 'fa-check-circle' : 'fa-file-upload'} animate-pulse`}></i>
+                 <span className="truncate max-w-[140px]">{controlTemplateFile ? controlTemplateFile.name : 'Load XLSX Template'}</span>
+               </button>
+               <input 
+                 type="file" 
+                 ref={templateInputRef} 
+                 onChange={(e) => setControlTemplateFile(e.target.files?.[0] || null)}
+                 className="hidden" 
+                 accept=".xlsx"
+               />
+            </div>
+
             <button 
               onClick={() => fileInputRef.current?.click()}
               disabled={isProcessing}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
-                isProcessing ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700 shadow-sm shadow-blue-200'
-              }`}
+              className="group flex items-center gap-2 px-6 py-2.5 bg-blue-600 text-white rounded-2xl font-bold hover:bg-blue-700 transition-all disabled:opacity-50 shadow-lg shadow-blue-500/30 active:scale-95"
             >
-              <i className="fa-solid fa-upload"></i>
-              <span>Upload Docs</span>
+              <i className="fa-solid fa-plus-circle group-hover:scale-110 transition-transform"></i>
+              <span>Import Orders</span>
             </button>
-            <input 
-              type="file" 
-              ref={fileInputRef} 
-              onChange={handleFileUpload} 
-              className="hidden" 
-              multiple 
-              accept="application/pdf,image/*"
-            />
+            <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" multiple accept="application/pdf,image/*" />
             
-            <button 
-              onClick={exportToCSV}
-              disabled={data.length === 0 || isProcessing}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-200 bg-white text-gray-700 font-medium hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-            >
-              <i className="fa-solid fa-download"></i>
-              <span>Export CSV</span>
-            </button>
-
-            {data.length > 0 && (
+            <div className="flex items-center bg-white border border-slate-200 rounded-2xl p-1 gap-1 shadow-sm">
               <button 
-                onClick={clearAll}
-                disabled={isProcessing}
-                className="p-2 text-gray-400 hover:text-red-500 transition-colors"
-                title="Clear All"
+                onClick={handleExportControlSurfaceXlsx}
+                disabled={rows.length === 0 || isProcessing}
+                className="flex items-center gap-2 px-4 py-2 text-emerald-700 hover:bg-emerald-50 rounded-xl font-bold disabled:opacity-30 transition-all text-sm group"
+                title="Template-based Excel Export"
               >
-                <i className="fa-solid fa-trash-can text-lg"></i>
+                <i className="fa-solid fa-file-excel group-hover:rotate-12 transition-transform"></i>
+                <span>Advanced XLSX</span>
+              </button>
+              <div className="w-px h-6 bg-slate-200"></div>
+              <button 
+                onClick={handleExportCSV}
+                disabled={rows.length === 0 || isProcessing}
+                className="flex items-center gap-2 px-4 py-2 text-slate-700 hover:bg-slate-50 rounded-xl font-bold disabled:opacity-30 transition-all text-sm"
+              >
+                <i className="fa-solid fa-file-csv"></i>
+                <span>CSV</span>
+              </button>
+            </div>
+
+            {rows.length > 0 && (
+              <button onClick={clearAll} className="p-2.5 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all" title="Clear All Data">
+                <i className="fa-solid fa-trash-alt"></i>
               </button>
             )}
           </div>
         </div>
       </header>
 
-      {/* Main Content */}
-      <main className="flex-grow max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8">
-        
-        {/* Stats Summary */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-          <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm">
-            <div className="flex items-center gap-4">
-              <div className="p-3 bg-blue-50 text-blue-600 rounded-lg">
-                <i className="fa-solid fa-list-check text-xl"></i>
+      <main className="flex-grow max-w-7xl mx-auto w-full px-6 py-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+          {[
+            { label: 'Lines Extracted', val: rows.length, color: 'text-slate-900', icon: 'fa-list-check' },
+            { label: 'Auto-Path Lanes', val: rows.filter(r => r.automation_lane === 'AUTO').length, color: 'text-emerald-600', icon: 'fa-robot' },
+            { label: 'Human Review', val: rows.filter(r => r.automation_lane !== 'AUTO').length, color: 'text-amber-500', icon: 'fa-user-pen' },
+            { label: 'Avg Confidence', val: `${rows.length > 0 ? Math.round((rows.reduce((a,b) => a + b.confidence_score, 0) / rows.length) * 100) : 0}%`, color: 'text-blue-600', icon: 'fa-crosshairs' }
+          ].map((stat, i) => (
+            <div key={i} className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm transition-all hover:shadow-md hover:-translate-y-1">
+              <div className="flex items-start justify-between mb-3">
+                <p className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.2em]">{stat.label}</p>
+                <i className={`fa-solid ${stat.icon} ${stat.color} opacity-20 text-xl`}></i>
               </div>
-              <div>
-                <p className="text-sm font-medium text-gray-500 uppercase">Total Items</p>
-                <p className="text-2xl font-bold text-gray-900">{data.length}</p>
-              </div>
+              <p className={`text-4xl font-black ${stat.color} tracking-tight`}>{stat.val}</p>
             </div>
-          </div>
-          <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm">
-            <div className="flex items-center gap-4">
-              <div className="p-3 bg-green-50 text-green-600 rounded-lg">
-                <i className="fa-solid fa-dollar-sign text-xl"></i>
-              </div>
-              <div>
-                <p className="text-sm font-medium text-gray-500 uppercase">Total Value</p>
-                <p className="text-2xl font-bold text-gray-900">
-                  ${data.reduce((acc, curr) => acc + curr.totalAmount, 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </p>
-              </div>
-            </div>
-          </div>
-          <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm">
-            <div className="flex items-center gap-4">
-              <div className="p-3 bg-purple-50 text-purple-600 rounded-lg">
-                <i className="fa-solid fa-file-contract text-xl"></i>
-              </div>
-              <div>
-                <p className="text-sm font-medium text-gray-500 uppercase">Unique Orders</p>
-                <p className="text-2xl font-bold text-gray-900">
-                  {new Set(data.map(i => `${i.orderNumber}-${i.documentType}`)).size}
-                </p>
-              </div>
-            </div>
-          </div>
+          ))}
         </div>
 
-        {/* Processing Indicator */}
         {isProcessing && (
-          <div className="mb-8 bg-blue-50 border border-blue-100 rounded-xl p-6 text-center animate-pulse">
-            <div className="flex flex-col items-center gap-3">
-              <div className="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-2"></div>
-              <h3 className="text-lg font-semibold text-blue-900">Processing Documents...</h3>
-              <p className="text-blue-700 text-sm">Gemini AI is scanning all pages for Invoices, Sales Orders, and more.</p>
-              <div className="w-full max-w-md bg-blue-200 rounded-full h-2.5 mt-2">
-                <div className="bg-blue-600 h-2.5 rounded-full transition-all duration-300" style={{ width: `${progress}%` }}></div>
+          <div className="mb-10 bg-white border border-blue-100 rounded-[2.5rem] p-12 text-center shadow-xl shadow-blue-500/5 relative overflow-hidden">
+            <div className="absolute top-0 left-0 w-full h-1 bg-blue-50 overflow-hidden">
+               <div className="h-full bg-blue-600 transition-all duration-300 shadow-[0_0_10px_rgba(37,99,235,0.5)]" style={{ width: `${progress}%` }}></div>
+            </div>
+            
+            <div className="flex flex-col items-center gap-6 relative z-10">
+              <div className="relative">
+                 <div className="w-24 h-24 border-[6px] border-slate-50 border-t-blue-600 rounded-full animate-spin"></div>
+                 <div className="absolute inset-0 flex items-center justify-center">
+                    <i className="fa-solid fa-microchip text-blue-600 text-3xl animate-pulse"></i>
+                 </div>
               </div>
-              <p className="text-xs text-blue-600 font-mono mt-1">{progress}% Complete</p>
+              <div>
+                <h3 className="text-2xl font-black text-slate-900 mb-2">{processingStatus}</h3>
+                <p className="text-slate-500 text-base max-w-lg mx-auto leading-relaxed">
+                  Parsing document geometry and mapping line items to your enterprise schema using Gemini 3 Vision.
+                </p>
+              </div>
+              <div className="w-full max-w-md">
+                <div className="bg-slate-100 rounded-full h-4 p-1 shadow-inner">
+                  <div className="bg-gradient-to-r from-blue-600 to-indigo-500 h-full rounded-full transition-all duration-700 ease-out shadow-sm" style={{ width: `${progress}%` }}></div>
+                </div>
+                <div className="flex justify-between mt-3 px-1">
+                   <p className="text-xs font-bold text-slate-400 font-mono tracking-widest uppercase">System Processing</p>
+                   <p className="text-sm font-black text-blue-600 font-mono">{Math.round(progress)}%</p>
+                </div>
+              </div>
             </div>
           </div>
         )}
 
-        {/* Spreadsheet Component */}
-        <DataTable data={data} onDelete={deleteItem} />
-
-        {/* Info Box */}
-        {data.length === 0 && !isProcessing && (
-          <div className="mt-12 bg-white rounded-xl border border-gray-200 p-8 text-center max-w-2xl mx-auto">
-            <h2 className="text-xl font-semibold text-gray-900 mb-2">Multi-Page Support</h2>
-            <p className="text-gray-500 mb-6">
-              Our AI is designed to process multi-page files. If a single PDF contains an Invoice, a Purchase Order, and a Picking Sheet on separate pages, it will extract data from each one and list them all below.
-            </p>
-            <div className="grid grid-cols-3 gap-4 text-left">
-              <div className="p-4 bg-gray-50 rounded-lg border border-gray-100">
-                <div className="text-blue-600 mb-2"><i className="fa-solid fa-clone"></i></div>
-                <h4 className="text-sm font-bold mb-1">Split Detection</h4>
-                <p className="text-xs text-gray-500">Automatically detects where one document ends and another begins.</p>
-              </div>
-              <div className="p-4 bg-gray-50 rounded-lg border border-gray-100">
-                <div className="text-green-600 mb-2"><i className="fa-solid fa-layer-group"></i></div>
-                <h4 className="text-sm font-bold mb-1">Flattened Data</h4>
-                <p className="text-xs text-gray-500">Every line item from every document becomes its own row.</p>
-              </div>
-              <div className="p-4 bg-gray-50 rounded-lg border border-gray-100">
-                <div className="text-purple-600 mb-2"><i className="fa-solid fa-magnifying-glass-plus"></i></div>
-                <h4 className="text-sm font-bold mb-1">Deep Scan</h4>
-                <p className="text-xs text-gray-500">Analyzes header fields (PO#, Dates) for every page individually.</p>
-              </div>
-            </div>
-          </div>
-        )}
+        <DataTable data={rows} onDelete={deleteRow} />
       </main>
 
-      {/* Footer */}
-      <footer className="bg-white border-t border-gray-200 py-6 mt-12">
-        <div className="max-w-7xl mx-auto px-4 text-center">
-          <p className="text-sm text-gray-400">
-            Powered by Gemini 3 Flash & React • {new Date().getFullYear()} OrderFlow Parser
-          </p>
+      <footer className="bg-white border-t border-slate-200 py-10 mt-auto">
+        <div className="max-w-7xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-6">
+          <div className="text-left">
+            <p className="text-[11px] text-slate-400 font-bold tracking-[0.25em] uppercase mb-2">Automated Supply Chain Logic</p>
+            <p className="text-sm text-slate-500 font-medium max-w-md">
+              Secure extraction for Sales and Purchase orders. High-fidelity mapping enabled via Advanced XLSX templates.
+            </p>
+          </div>
+          <div className="flex items-center gap-10">
+            <div className="text-center">
+              <p className="text-[10px] text-slate-400 font-bold uppercase mb-2 tracking-wider">AI Framework</p>
+              <div className="flex items-center gap-2 bg-slate-50 px-4 py-1.5 rounded-xl border border-slate-200 shadow-sm">
+                <i className="fa-solid fa-bolt-lightning text-amber-500 text-xs"></i>
+                <span className="text-xs font-black text-slate-700">Gemini 3 Flash</span>
+              </div>
+            </div>
+            <div className="text-center">
+              <p className="text-[10px] text-slate-400 font-bold uppercase mb-2 tracking-wider">Storage Policy</p>
+              <div className="flex items-center gap-2 bg-slate-50 px-4 py-1.5 rounded-xl border border-slate-200 shadow-sm">
+                <i className="fa-solid fa-ghost text-blue-500 text-xs"></i>
+                <span className="text-xs font-black text-slate-700">In-Memory Only</span>
+              </div>
+            </div>
+          </div>
         </div>
       </footer>
     </div>

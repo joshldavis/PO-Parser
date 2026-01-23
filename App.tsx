@@ -1,3 +1,4 @@
+
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { POLineRow, GeminiParsingResult } from './types';
 import { ReferencePack } from './referencePack.schema';
@@ -84,9 +85,14 @@ const App: React.FC = () => {
 
         allNewRows = [...allNewRows, ...mappedRows];
 
-      } catch (error) {
+      } catch (error: any) {
         console.error(`Error processing ${file.name}:`, error);
-        alert(`Could not process ${file.name}. Ensure your Gemini API Key is valid.`);
+        const msg = error?.message || "";
+        if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) {
+          alert(`Rate limit exceeded for ${file.name}. Please wait a moment and try again with fewer files.`);
+        } else {
+          alert(`Could not process ${file.name}. Check your connection or API configuration.`);
+        }
       }
       
       setProgress(Math.round(((i + 1) / files.length) * 100));
@@ -172,7 +178,6 @@ const App: React.FC = () => {
         }
       }
 
-      // Final routing pass for data integrity
       const routed = applyPolicyRouting(rows, currentPolicy, { phase: "PHASE_1" });
 
       const blob = buildControlSurfaceWorkbook({

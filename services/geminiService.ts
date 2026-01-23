@@ -1,9 +1,8 @@
-
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
 import { GeminiParsingResult } from "../types";
 import { ReferencePack } from "../referencePack.schema";
 
-// Initialize with named parameter and direct process.env reference as per guidelines
+// Initialize with named parameter and direct process.env reference
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 const DOCUMENT_SCHEMA = {
@@ -61,7 +60,6 @@ const DOCUMENT_SCHEMA = {
           quantityShipped: { type: Type.NUMBER, description: "Total quantity shipped/supplied." },
           unitPrice: { type: Type.NUMBER, description: "Cost per single unit." },
           totalAmount: { type: Type.NUMBER, description: "Line extension total." },
-          // Normalization hints
           manufacturer: { type: Type.STRING, description: "Identified manufacturer from Ref Pack or text." },
           finish: { type: Type.STRING, description: "Identified finish code (e.g. US26D)." },
           category: { type: Type.STRING, description: "Identified hardware category." },
@@ -87,6 +85,23 @@ const PARSER_SCHEMA = {
   required: ["documents"]
 };
 
+/**
+ * Helper to handle API resilience with exponential backoff
+ */
+async function withRetry<T>(fn: () => Promise<T>, retries = 3, delay = 2000): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: any) {
+    const isRetryable = error?.status === 429 || error?.message?.includes("429") || error?.message?.includes("RESOURCE_EXHAUSTED");
+    if (isRetryable && retries > 0) {
+      console.warn(`Rate limit hit. Retrying in ${delay}ms... (${retries} retries left)`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return withRetry(fn, retries - 1, delay * 2);
+    }
+    throw error;
+  }
+}
+
 export async function parseDocument(
   fileBase64: string, 
   mimeType: string, 
@@ -108,8 +123,8 @@ export async function parseDocument(
     `;
   }
 
-  // Use gemini-3-pro-preview for complex reasoning tasks like document extraction and normalization
-  const response = await ai.models.generateContent({
+  // Fix: Explicitly typing the response as GenerateContentResponse to fix property access errors on 'unknown' type.
+  const response: GenerateContentResponse = await withRetry(() => ai.models.generateContent({
     model: "gemini-3-pro-preview",
     contents: [
       {
@@ -144,15 +159,18 @@ export async function parseDocument(
       responseSchema: PARSER_SCHEMA,
       temperature: 0.1,
     },
-  });
+  }));
 
+  // Fix: Property 'text' is accessible after proper typing of GenerateContentResponse
   if (!response.text) {
     throw new Error("Empty response from AI engine");
   }
 
   try {
+    // Fix: Access .text property directly to get response string as per Gemini API guidelines
     return JSON.parse(response.text.trim()) as GeminiParsingResult;
   } catch (e) {
+    // Fix: Accessing .text for error reporting
     console.error("JSON Parsing failed", e, response.text);
     throw new Error("AI returned invalid JSON.");
   }

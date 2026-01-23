@@ -1,8 +1,12 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import { POLineRow, GeminiParsingResult } from './types';
+import { ReferencePack } from './referencePack.schema';
 import { parseDocument } from './services/geminiService';
-import { geminiResultToPOLineRows, applyPhase1Routing, rowsToCsv, downloadCsv } from './services/mappingService';
+import { geminiResultToPOLineRows, downloadCsv } from './services/mappingService';
 import { buildControlSurfaceWorkbook, downloadBlob } from './services/xlsxExport';
+import { exportControlSurfaceXlsxUsingTemplate, exportControlSurfaceCsv } from './services/controlSurfaceExport';
+import { ReferenceService } from './services/referenceService';
+import { enrichAndValidate } from './services/enrichAndValidate';
 import DataTable from './components/DataTable';
 
 declare const Tesseract: any;
@@ -13,14 +17,14 @@ const App: React.FC = () => {
   const [processingStatus, setProcessingStatus] = useState<string>('');
   const [progress, setProgress] = useState(0);
   const [controlTemplateFile, setControlTemplateFile] = useState<File | null>(null);
+  const [referencePack, setReferencePack] = useState<ReferencePack | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const templateInputRef = useRef<HTMLInputElement>(null);
+  const refPackInputRef = useRef<HTMLInputElement>(null);
 
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
-    if (!files || files.length === 0) return;
-
+  const processFiles = async (files: FileList) => {
     setIsProcessing(true);
     let allNewRows: POLineRow[] = [];
 
@@ -34,28 +38,43 @@ const App: React.FC = () => {
         let ocrTextHint = '';
         if (file.type.startsWith('image/')) {
           setProcessingStatus(`OCR analyzing: ${file.name}...`);
-          setProgress(baseProgress + (stepSize * 0.3));
-          const result = await Tesseract.recognize(file, 'eng');
-          ocrTextHint = result.data.text;
+          setProgress(baseProgress + (stepSize * 0.2));
+          try {
+            const result = await Tesseract.recognize(file, 'eng');
+            ocrTextHint = result.data.text;
+          } catch (ocrErr) {
+            console.warn("OCR Hint failed", ocrErr);
+          }
         }
 
-        setProcessingStatus(`Gemini extracting: ${file.name}...`);
-        setProgress(baseProgress + (stepSize * 0.7));
+        setProcessingStatus(`AI Extracting: ${file.name}...`);
+        setProgress(baseProgress + (stepSize * 0.5));
 
         const base64 = await fileToBase64(file);
-        const parsed: GeminiParsingResult = await parseDocument(base64, file.type, ocrTextHint);
+        const parsed: GeminiParsingResult = await parseDocument(
+          base64, 
+          file.type, 
+          ocrTextHint, 
+          referencePack || undefined
+        );
         
-        const rows0 = geminiResultToPOLineRows({ 
+        let mappedRows = geminiResultToPOLineRows({ 
           parsed, 
-          sourceFileStem: fileStem 
+          sourceFileStem: fileStem,
+          refPack: referencePack
         });
 
-        const routedRows = applyPhase1Routing(rows0);
-        allNewRows = [...allNewRows, ...routedRows];
+        // If we have a reference pack, run the enrichment and validation engine
+        if (referencePack) {
+          const refService = new ReferenceService(referencePack);
+          mappedRows = enrichAndValidate(mappedRows, refService, referencePack.version);
+        }
+
+        allNewRows = [...allNewRows, ...mappedRows];
 
       } catch (error) {
         console.error(`Error processing ${file.name}:`, error);
-        alert(`Could not process ${file.name}. Ensure file is a valid PDF or Image.`);
+        alert(`Could not process ${file.name}. Ensure your Gemini API Key is valid.`);
       }
       
       setProgress(Math.round(((i + 1) / files.length) * 100));
@@ -66,6 +85,35 @@ const App: React.FC = () => {
     setProgress(0);
     setProcessingStatus('');
     if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleRefPackUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const json = JSON.parse(e.target?.result as string) as ReferencePack;
+        if (json.version && Array.isArray(json.manufacturers)) {
+          setReferencePack(json);
+          alert(`Reference Pack v${json.version} loaded successfully!`);
+        } else {
+          throw new Error("Invalid format");
+        }
+      } catch (err) {
+        alert("Failed to load reference pack: JSON structure invalid.");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleTemplateUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      setControlTemplateFile(file);
+      alert(`Template loaded: ${file.name}`);
+    }
   };
 
   const fileToBase64 = (file: File): Promise<string> => {
@@ -83,198 +131,159 @@ const App: React.FC = () => {
 
   const handleExportCSV = () => {
     if (rows.length === 0) return;
-    const csv = rowsToCsv(rows);
-    const filename = `OrderFlow_Export_${new Date().getTime()}.csv`;
-    downloadCsv(filename, csv);
+    const csv = exportControlSurfaceCsv(rows);
+    downloadCsv(`OrderFlow_ControlSurface_${Date.now()}.csv`, csv);
   };
 
   const handleExportControlSurfaceXlsx = async () => {
     if (rows.length === 0) return;
-    if (!controlTemplateFile) {
-      alert("Please upload a 'Control Surface' template file (.xlsx) first.");
-      templateInputRef.current?.click();
-      return;
-    }
-    
     try {
-      const buf = await controlTemplateFile.arrayBuffer();
-      const blob = buildControlSurfaceWorkbook({
-        templateArrayBuffer: buf,
-        poLineRows: rows,
+      let templateBuf: ArrayBuffer;
+
+      if (controlTemplateFile) {
+        templateBuf = await controlTemplateFile.arrayBuffer();
+      } else {
+        // Fetch default master template from the server/public folder
+        const resp = await fetch("/PO_Automation_Control_Surface_Template_v3.xlsx");
+        if (!resp.ok) {
+           // Fallback to generating a fresh sheet if master template is missing in public folder
+           const blob = buildControlSurfaceWorkbook({ poLineRows: rows });
+           downloadBlob(`OrderFlow_Export_${Date.now()}.xlsx`, blob);
+           return;
+        }
+        templateBuf = await resp.arrayBuffer();
+      }
+
+      const outputBuf = exportControlSurfaceXlsxUsingTemplate({
+        rows,
+        templateArrayBuffer: templateBuf,
+        sheetName: "PO_LineItem_Analysis",
       });
 
-      downloadBlob(`OrderFlow_ControlSurface_${new Date().getTime()}.xlsx`, blob);
+      const blob = new Blob([outputBuf], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+      downloadBlob(`PO_Automation_Control_Surface_${Date.now()}.xlsx`, blob);
     } catch (err: any) {
+      console.error("XLSX Export Error:", err);
       alert("Export failed: " + err.message);
     }
   };
 
-  const deleteRow = (index: number) => {
-    setRows(prev => prev.filter((_, i) => i !== index));
-  };
-
-  const clearAll = () => {
-    if (confirm("Clear all extracted lines from memory?")) {
-      setRows([]);
-    }
-  };
-
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col antialiased text-slate-900">
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-40 shadow-sm backdrop-blur-md bg-white/80">
+    <div 
+      className={`min-h-screen bg-slate-50 flex flex-col antialiased text-slate-900 transition-colors duration-300 ${isDragging ? 'bg-blue-50/50' : ''}`}
+      onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+      onDragLeave={() => setIsDragging(false)}
+      onDrop={(e) => { e.preventDefault(); setIsDragging(false); if (e.dataTransfer.files) processFiles(e.dataTransfer.files); }}
+    >
+      <header className="bg-white/90 border-b border-slate-200 sticky top-0 z-40 backdrop-blur-xl">
         <div className="max-w-7xl mx-auto px-6 py-4 flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-4">
-            <div className="bg-gradient-to-tr from-blue-600 to-indigo-700 p-2.5 rounded-2xl shadow-xl shadow-blue-500/20">
-              <i className="fa-solid fa-file-invoice text-white text-2xl"></i>
+            <div className="bg-gradient-to-br from-indigo-600 to-blue-500 p-2.5 rounded-2xl shadow-lg shadow-blue-500/20">
+              <i className="fa-solid fa-file-invoice-dollar text-white text-2xl"></i>
             </div>
             <div>
-              <h1 className="text-2xl font-black tracking-tight leading-none">OrderFlow <span className="text-blue-600">Pro</span></h1>
-              <div className="flex items-center gap-2 mt-1">
-                 <span className="text-[10px] bg-slate-900 text-white px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">Enterprise v3</span>
-                 <p className="text-[11px] text-slate-400 font-medium">Advanced Data Pipeline</p>
+              <h1 className="text-2xl font-black tracking-tight text-slate-900">OrderFlow <span className="text-blue-600">Pro</span></h1>
+              <div className="flex items-center gap-2 mt-0.5">
+                 <span className="text-[10px] bg-blue-600 text-white px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">Grounded AI</span>
+                 <p className="text-[11px] text-slate-400 font-medium">Enterprise Data Processor</p>
               </div>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
-            {/* Template Selection */}
-            <div className="hidden lg:flex flex-col items-end mr-4 bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-xl shadow-inner">
-               <span className="text-[9px] font-black text-slate-400 uppercase mb-1 tracking-widest">Active Template</span>
-               <button 
-                 onClick={() => templateInputRef.current?.click()}
-                 className={`text-[11px] font-bold transition-all flex items-center gap-2 px-2 py-0.5 rounded-lg ${controlTemplateFile ? 'text-emerald-700 bg-emerald-50 border border-emerald-100' : 'text-blue-600 bg-blue-50 border border-blue-100 hover:bg-blue-100'}`}
-               >
-                 <i className={`fa-solid ${controlTemplateFile ? 'fa-check-circle' : 'fa-file-upload'} animate-pulse`}></i>
-                 <span className="truncate max-w-[140px]">{controlTemplateFile ? controlTemplateFile.name : 'Load XLSX Template'}</span>
-               </button>
-               <input 
-                 type="file" 
-                 ref={templateInputRef} 
-                 onChange={(e) => setControlTemplateFile(e.target.files?.[0] || null)}
-                 className="hidden" 
-                 accept=".xlsx"
-               />
+            <div className="hidden lg:flex flex-col items-end mr-2 bg-white border border-slate-200 px-3 py-1.5 rounded-xl shadow-sm">
+               <span className="text-[9px] font-black text-slate-400 uppercase mb-1 tracking-widest">Config</span>
+               <div className="flex gap-2">
+                 <button 
+                   onClick={() => refPackInputRef.current?.click()}
+                   className={`text-[10px] font-bold transition-all flex items-center gap-1.5 px-2 py-0.5 rounded-lg ${referencePack ? 'text-indigo-700 bg-indigo-50' : 'text-slate-500 bg-slate-50 hover:bg-slate-100'}`}
+                   title="Load Reference Pack"
+                 >
+                   <i className={`fa-solid ${referencePack ? 'fa-book-bookmark' : 'fa-book'}`}></i>
+                   <span>{referencePack ? `KB v${referencePack.version}` : 'Ref Pack'}</span>
+                 </button>
+                 <button 
+                   onClick={() => templateInputRef.current?.click()}
+                   className={`text-[10px] font-bold transition-all flex items-center gap-1.5 px-2 py-0.5 rounded-lg ${controlTemplateFile ? 'text-emerald-700 bg-emerald-50' : 'text-slate-500 bg-slate-50 hover:bg-slate-100'}`}
+                   title="Load XLSX Template"
+                 >
+                   <i className={`fa-solid ${controlTemplateFile ? 'fa-file-circle-check' : 'fa-file-excel'}`}></i>
+                   <span>{controlTemplateFile ? 'Template OK' : 'Template'}</span>
+                 </button>
+               </div>
+               <input type="file" ref={refPackInputRef} onChange={handleRefPackUpload} className="hidden" accept=".json" />
+               <input type="file" ref={templateInputRef} onChange={handleTemplateUpload} className="hidden" accept=".xlsx" />
             </div>
 
             <button 
               onClick={() => fileInputRef.current?.click()}
               disabled={isProcessing}
-              className="group flex items-center gap-2 px-6 py-2.5 bg-blue-600 text-white rounded-2xl font-bold hover:bg-blue-700 transition-all disabled:opacity-50 shadow-lg shadow-blue-500/30 active:scale-95"
+              className="group flex items-center gap-2 px-6 py-2.5 bg-slate-900 text-white rounded-2xl font-bold hover:bg-blue-600 transition-all shadow-xl active:scale-95"
             >
-              <i className="fa-solid fa-plus-circle group-hover:scale-110 transition-transform"></i>
-              <span>Import Orders</span>
+              <i className="fa-solid fa-plus-circle"></i>
+              <span>Import Documents</span>
             </button>
-            <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" multiple accept="application/pdf,image/*" />
+            <input type="file" ref={fileInputRef} onChange={(e) => e.target.files && processFiles(e.target.files)} className="hidden" multiple accept="application/pdf,image/*" />
             
             <div className="flex items-center bg-white border border-slate-200 rounded-2xl p-1 gap-1 shadow-sm">
               <button 
                 onClick={handleExportControlSurfaceXlsx}
                 disabled={rows.length === 0 || isProcessing}
-                className="flex items-center gap-2 px-4 py-2 text-emerald-700 hover:bg-emerald-50 rounded-xl font-bold disabled:opacity-30 transition-all text-sm group"
-                title="Template-based Excel Export"
+                className="flex items-center gap-2 px-4 py-2 text-emerald-700 hover:bg-emerald-50 rounded-xl font-bold disabled:opacity-30 transition-all text-sm"
               >
-                <i className="fa-solid fa-file-excel group-hover:rotate-12 transition-transform"></i>
-                <span>Advanced XLSX</span>
+                <i className="fa-solid fa-file-excel"></i>
+                <span className="hidden sm:inline">XLSX</span>
               </button>
-              <div className="w-px h-6 bg-slate-200"></div>
               <button 
                 onClick={handleExportCSV}
                 disabled={rows.length === 0 || isProcessing}
                 className="flex items-center gap-2 px-4 py-2 text-slate-700 hover:bg-slate-50 rounded-xl font-bold disabled:opacity-30 transition-all text-sm"
               >
                 <i className="fa-solid fa-file-csv"></i>
-                <span>CSV</span>
+                <span className="hidden sm:inline">CSV</span>
               </button>
             </div>
-
-            {rows.length > 0 && (
-              <button onClick={clearAll} className="p-2.5 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all" title="Clear All Data">
-                <i className="fa-solid fa-trash-alt"></i>
-              </button>
-            )}
           </div>
         </div>
       </header>
 
       <main className="flex-grow max-w-7xl mx-auto w-full px-6 py-8">
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-          {[
-            { label: 'Lines Extracted', val: rows.length, color: 'text-slate-900', icon: 'fa-list-check' },
-            { label: 'Auto-Path Lanes', val: rows.filter(r => r.automation_lane === 'AUTO').length, color: 'text-emerald-600', icon: 'fa-robot' },
-            { label: 'Human Review', val: rows.filter(r => r.automation_lane !== 'AUTO').length, color: 'text-amber-500', icon: 'fa-user-pen' },
-            { label: 'Avg Confidence', val: `${rows.length > 0 ? Math.round((rows.reduce((a,b) => a + b.confidence_score, 0) / rows.length) * 100) : 0}%`, color: 'text-blue-600', icon: 'fa-crosshairs' }
-          ].map((stat, i) => (
-            <div key={i} className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm transition-all hover:shadow-md hover:-translate-y-1">
-              <div className="flex items-start justify-between mb-3">
-                <p className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.2em]">{stat.label}</p>
-                <i className={`fa-solid ${stat.icon} ${stat.color} opacity-20 text-xl`}></i>
-              </div>
-              <p className={`text-4xl font-black ${stat.color} tracking-tight`}>{stat.val}</p>
+        {isProcessing ? (
+          <div className="mb-10 bg-white border border-blue-100 rounded-[3rem] p-16 text-center shadow-2xl relative overflow-hidden">
+            <div className="absolute top-0 left-0 w-full h-1.5 bg-slate-50">
+               <div className="h-full bg-blue-600 transition-all duration-500 ease-out shadow-[0_0_15px_rgba(37,99,235,0.6)]" style={{ width: `${progress}%` }}></div>
             </div>
-          ))}
-        </div>
-
-        {isProcessing && (
-          <div className="mb-10 bg-white border border-blue-100 rounded-[2.5rem] p-12 text-center shadow-xl shadow-blue-500/5 relative overflow-hidden">
-            <div className="absolute top-0 left-0 w-full h-1 bg-blue-50 overflow-hidden">
-               <div className="h-full bg-blue-600 transition-all duration-300 shadow-[0_0_10px_rgba(37,99,235,0.5)]" style={{ width: `${progress}%` }}></div>
-            </div>
-            
-            <div className="flex flex-col items-center gap-6 relative z-10">
+            <div className="flex flex-col items-center gap-8">
               <div className="relative">
-                 <div className="w-24 h-24 border-[6px] border-slate-50 border-t-blue-600 rounded-full animate-spin"></div>
+                 <div className="w-28 h-28 border-[6px] border-slate-100 border-t-blue-600 rounded-full animate-spin"></div>
                  <div className="absolute inset-0 flex items-center justify-center">
-                    <i className="fa-solid fa-microchip text-blue-600 text-3xl animate-pulse"></i>
+                    <i className="fa-solid fa-bolt-lightning text-blue-600 text-4xl animate-pulse"></i>
                  </div>
               </div>
-              <div>
-                <h3 className="text-2xl font-black text-slate-900 mb-2">{processingStatus}</h3>
-                <p className="text-slate-500 text-base max-w-lg mx-auto leading-relaxed">
-                  Parsing document geometry and mapping line items to your enterprise schema using Gemini 3 Vision.
-                </p>
-              </div>
-              <div className="w-full max-w-md">
-                <div className="bg-slate-100 rounded-full h-4 p-1 shadow-inner">
-                  <div className="bg-gradient-to-r from-blue-600 to-indigo-500 h-full rounded-full transition-all duration-700 ease-out shadow-sm" style={{ width: `${progress}%` }}></div>
-                </div>
-                <div className="flex justify-between mt-3 px-1">
-                   <p className="text-xs font-bold text-slate-400 font-mono tracking-widest uppercase">System Processing</p>
-                   <p className="text-sm font-black text-blue-600 font-mono">{Math.round(progress)}%</p>
+              <h3 className="text-3xl font-black text-slate-900 mb-3">{processingStatus}</h3>
+              <div className="w-full max-w-lg">
+                <div className="bg-slate-100 rounded-full h-5 p-1.5 shadow-inner">
+                  <div className="bg-gradient-to-r from-blue-600 to-indigo-500 h-full rounded-full transition-all duration-700 ease-out" style={{ width: `${progress}%` }}></div>
                 </div>
               </div>
             </div>
           </div>
-        )}
-
-        <DataTable data={rows} onDelete={deleteRow} />
-      </main>
-
-      <footer className="bg-white border-t border-slate-200 py-10 mt-auto">
-        <div className="max-w-7xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-6">
-          <div className="text-left">
-            <p className="text-[11px] text-slate-400 font-bold tracking-[0.25em] uppercase mb-2">Automated Supply Chain Logic</p>
-            <p className="text-sm text-slate-500 font-medium max-w-md">
-              Secure extraction for Sales and Purchase orders. High-fidelity mapping enabled via Advanced XLSX templates.
+        ) : rows.length === 0 ? (
+          <div className="mb-10 bg-white border-2 border-dashed border-slate-200 rounded-[3rem] p-24 text-center group hover:border-blue-400 transition-all cursor-pointer" onClick={() => fileInputRef.current?.click()}>
+            <div className="w-24 h-24 bg-slate-50 rounded-full flex items-center justify-center mx-auto mb-6">
+               <i className="fa-solid fa-cloud-arrow-up text-4xl text-slate-300 group-hover:text-blue-500"></i>
+            </div>
+            <h2 className="text-3xl font-black text-slate-900 mb-3">Drop Orders to Begin</h2>
+            <p className="text-slate-500 text-lg max-w-md mx-auto mb-8">
+              OrderFlow uses grounded AI to extract and normalize hardware order items for ERP injection.
             </p>
           </div>
-          <div className="flex items-center gap-10">
-            <div className="text-center">
-              <p className="text-[10px] text-slate-400 font-bold uppercase mb-2 tracking-wider">AI Framework</p>
-              <div className="flex items-center gap-2 bg-slate-50 px-4 py-1.5 rounded-xl border border-slate-200 shadow-sm">
-                <i className="fa-solid fa-bolt-lightning text-amber-500 text-xs"></i>
-                <span className="text-xs font-black text-slate-700">Gemini 3 Flash</span>
-              </div>
-            </div>
-            <div className="text-center">
-              <p className="text-[10px] text-slate-400 font-bold uppercase mb-2 tracking-wider">Storage Policy</p>
-              <div className="flex items-center gap-2 bg-slate-50 px-4 py-1.5 rounded-xl border border-slate-200 shadow-sm">
-                <i className="fa-solid fa-ghost text-blue-500 text-xs"></i>
-                <span className="text-xs font-black text-slate-700">In-Memory Only</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </footer>
+        ) : (
+          <DataTable data={rows} onDelete={(idx) => setRows(prev => prev.filter((_, i) => i !== idx))} />
+        )}
+      </main>
     </div>
   );
 };

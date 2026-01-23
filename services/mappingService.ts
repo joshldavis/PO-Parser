@@ -1,6 +1,8 @@
-import { GeminiParsingResult, POLineRow, EdgeCaseCode, AutomationLane } from "../types";
-import * as XLSX from "xlsx";
+import { GeminiParsingResult, POLineRow } from "../types";
+import { ReferencePack } from "../referencePack.schema";
+import { ReferenceService } from "./referenceService";
 
+// from old version
 const DIMENSION_RE = /\bCUT\s*TO\b|(\d+\s*-\s*\d+\/\d+)|(\d+\s*\/\s*\d+)\s*\"/i;
 
 function docTypeToRowDocType(dt: string): POLineRow["doc_type"] {
@@ -12,71 +14,143 @@ function docTypeToRowDocType(dt: string): POLineRow["doc_type"] {
   return "UNKNOWN";
 }
 
-function uniqTop3(flags: EdgeCaseCode[]) {
+function uniqTop3(flags: string[]) {
   const uniq = Array.from(new Set(flags)).filter(Boolean);
   return [uniq[0] ?? "", uniq[1] ?? "", uniq[2] ?? ""] as const;
 }
 
-/**
- * Maps Gemini extraction results to the enterprise POLineRow schema.
- */
 export function geminiResultToPOLineRows(args: {
   parsed: GeminiParsingResult;
   sourceFileStem: string;
+  refPack?: ReferencePack | null;
 }): POLineRow[] {
-  const { parsed, sourceFileStem } = args;
+  const { parsed, sourceFileStem, refPack } = args;
   const rows: POLineRow[] = [];
   let lineCounter = 1;
 
+  const refService = refPack ? new ReferenceService(refPack) : null;
+
   for (const doc of parsed.documents ?? []) {
     const doc_type = docTypeToRowDocType(doc.documentType);
-    const doc_id = (doc.orderNumber && doc.orderNumber.trim()) ? doc.orderNumber.trim() : sourceFileStem;
+    const doc_id =
+      (doc.orderNumber && doc.orderNumber.trim())
+        ? doc.orderNumber.trim()
+        : sourceFileStem;
 
     for (const li of doc.lineItems ?? []) {
+      const combinedText = `${li.itemNumber ?? ""} ${li.description ?? ""}`.trim();
+
+      // deterministic normalization (if ref pack loaded)
+      const mRef =
+        refService?.normalizeManufacturer(combinedText) ||
+        refService?.normalizeManufacturer(li.manufacturer || "");
+
+      const fRef =
+        refService?.normalizeFinish(combinedText) ||
+        refService?.normalizeFinish(li.finish || "");
+
+      const catRef =
+        refService?.detectCategory(combinedText) ||
+        refService?.detectCategory(li.category || "");
+
+      const elecRef = refService?.detectElectrifiedDevice(combinedText);
+      const hwSetRef = refService?.detectHardwareSet(combinedText);
+      const wireRef = elecRef ? refService?.detectWiring(elecRef.device_type) : undefined;
+
+      const m_abbr = mRef?.abbr || "";
+      const m_full = mRef?.name || li.manufacturer || "";
+      const f_us = fRef?.us_code || li.finish || "";
+      const f_bhma = fRef?.bhma_code || "";
+      const g_sym = catRef?.gordon_symbol || "";
+      const cat = catRef?.category || li.category || "";
+      const subcat = catRef?.subcategory || "";
+
+      // Improved AUTO readiness heuristic:
+      // - If itemNumber looks like an ABH catalog item OR description explicitly includes ABH + finish OR we have deterministic manufacturer
+      const descUpper = (li.description || "").toUpperCase();
+      const itemUpper = (li.itemNumber || "").toUpperCase();
+
+      const looksLikeABH =
+        itemUpper.startsWith("ABH") ||
+        descUpper.includes("*ABH") ||
+        descUpper.includes(" ABH ");
+
+      const hasSomeIdentity = Boolean(li.itemNumber || li.description);
+      const isAutoReadySeed = hasSomeIdentity && (looksLikeABH || Boolean(m_abbr));
+
       rows.push({
         doc_id,
         doc_type,
         customer_name: doc.customerName ?? "",
         customer_po_number: doc.customerPO ?? "",
         doc_date: doc.orderDate ?? "",
-        ship_to_address_raw: doc.shipToAddressRaw ?? "",
-        bill_to_address_raw: doc.billToAddressRaw ?? "",
-        mark_instructions: doc.markInstructions ?? "",
+
         line_no: lineCounter++,
-        item_no: li.itemNumber ?? "",
-        customer_item_no: "",
-        customer_item_desc_raw: li.description ?? "",
-        qty: (typeof li.quantityOrdered === "number" ? li.quantityOrdered : null),
-        uom: li.unit ?? "",
-        unit_price: (typeof li.unitPrice === "number" ? li.unitPrice : null),
-        extended_price: (typeof li.totalAmount === "number" ? li.totalAmount : null),
+        customer_item_no: li.itemNumber ?? "",
+        description_raw: li.description ?? "",
+        quantity: typeof li.quantityOrdered === "number" ? li.quantityOrdered : null,
+        uom_raw: li.unit ?? "",
+        unit_price: typeof li.unitPrice === "number" ? li.unitPrice : null,
+        extended_price: typeof li.totalAmount === "number" ? li.totalAmount : null,
+
+        // grounded normalization
+        manufacturer_abbr: m_abbr,
+        manufacturer_full: m_full,
+        finish_us_code: f_us,
+        finish_bhma_code: f_bhma,
+        category: cat,
+        subcategory: subcat,
+        gordon_symbol: g_sym,
+
+        electrified_device_type: elecRef?.device_type || "",
+        voltage: li.voltage || (elecRef?.voltage?.[0] || ""),
+        fail_mode: li.failMode || (elecRef?.fail_modes?.[0] || ""),
+        wiring_configuration: wireRef?.name || "",
+        hardware_set_template: hwSetRef?.template_id || "",
+
+        match_score: isAutoReadySeed ? 0.9 : 0.65,
+        match_method: mRef ? "DETERMINISTIC_GROUNDED" : "AI_PROBABILISTIC",
+        rule_violations: [],
+        reference_version: refPack?.version,
+
+        automation_lane: "ASSIST",   // set by routing below
+        phase_target: 1,             // set by routing below
+        sage_import_ready: false,    // set by routing below
+        sage_blockers: [],           // set by routing below
+        needs_review_reason: "",     // set by routing below
+
+        // extra context
+        bill_to_address_raw: doc.billToAddressRaw,
+        ship_to_address_raw: doc.shipToAddressRaw,
+        mark_instructions: doc.markInstructions,
+
+        // legacy fields (populated in routing)
         item_class: "UNKNOWN",
         edge_case_flag_1: "",
         edge_case_flag_2: "",
         edge_case_flag_3: "",
-        confidence_score: 0.85,
         fields_requiring_review: "",
         routing_reason: "",
-        automation_lane: "ASSIST",
-        phase_target: 1,
-        abh_item_no_candidate: li.itemNumber ?? "",
-        abh_item_no_final: "",
+        deterministic_rule_exists: "",
+        confidence_score: undefined,
       });
     }
   }
-  return rows;
+
+  // Restore routing logic
+  return applyPhase1Routing(rows);
 }
 
 /**
- * Applies routing rules for lane assignment and edge-case detection.
+ * Restored Phase 1 routing + edge-case detection (adapted to current POLineRow fields).
  */
 export function applyPhase1Routing(rows: POLineRow[]): POLineRow[] {
   return rows.map((r) => {
-    const descRaw = r.customer_item_desc_raw || "";
+    const descRaw = r.description_raw || "";
     const desc = descRaw.toUpperCase();
-    const flags: EdgeCaseCode[] = [];
+    const flags: string[] = [];
 
-    if (r.doc_id.toUpperCase().includes("-CM") || r.doc_type === "CREDIT_MEMO") flags.push("CREDIT_MEMO");
+    if ((r.doc_id || "").toUpperCase().includes("-CM") || r.doc_type === "CREDIT_MEMO") flags.push("CREDIT_MEMO");
     if (desc.includes("RGA")) flags.push("RGA");
     if (desc.includes("SPECIAL LAYOUT")) flags.push("SPECIAL_LAYOUT");
     if (DIMENSION_RE.test(descRaw)) flags.push("CUSTOM_LENGTH");
@@ -88,12 +162,18 @@ export function applyPhase1Routing(rows: POLineRow[]): POLineRow[] {
 
     const item_class =
       (flags.includes("SPECIAL_LAYOUT") || flags.includes("CUSTOM_LENGTH") || flags.includes("WIRING_SPEC")) ? "CUSTOM" :
-      (r.item_no && r.item_no.trim().length > 0) ? "CATALOG" :
+      (r.customer_item_no && r.customer_item_no.trim().length > 0) ? "CATALOG" :
       "UNKNOWN";
 
-    const hardBlock = flags.includes("CREDIT_MEMO") || flags.includes("RGA") || flags.includes("SPECIAL_LAYOUT");
-    let lane: AutomationLane = "ASSIST";
+    const hardBlock =
+      flags.includes("CREDIT_MEMO") || flags.includes("RGA") || flags.includes("SPECIAL_LAYOUT");
+
+    let lane: POLineRow["automation_lane"] = "ASSIST";
     let phase_target: 1 | 2 | 3 = 1;
+
+    const confidence = typeof r.confidence_score === "number"
+      ? r.confidence_score
+      : (typeof r.match_score === "number" ? r.match_score : 0.65);
 
     if (hardBlock) {
       lane = "HUMAN";
@@ -105,15 +185,21 @@ export function applyPhase1Routing(rows: POLineRow[]): POLineRow[] {
       lane = "ASSIST";
       phase_target = 3;
     } else {
-      lane = (r.confidence_score >= 0.9) ? "AUTO" : "ASSIST";
+      lane = (confidence >= 0.9) ? "AUTO" : "ASSIST";
       phase_target = 1;
     }
 
     const fieldsToReview =
       lane === "AUTO" ? "" :
-      hardBlock ? "doc_type;doc_id;customer_item_desc_raw" :
-      flags.includes("CUSTOM_LENGTH") ? "customer_item_desc_raw;qty;item_no" :
-      "qty;unit_price;item_no";
+      hardBlock ? "doc_type;doc_id;description_raw" :
+      flags.includes("CUSTOM_LENGTH") ? "description_raw;quantity;customer_item_no" :
+      "quantity;unit_price;customer_item_no";
+
+    const routing_reason =
+      hardBlock ? `Hard-block: ${flags.join(",")}` :
+      flags.length ? `Edge-cases: ${flags.join(",")}` :
+      lane === "AUTO" ? "High confidence + no flags" :
+      "Needs review";
 
     return {
       ...r,
@@ -123,24 +209,62 @@ export function applyPhase1Routing(rows: POLineRow[]): POLineRow[] {
       edge_case_flag_3: f3,
       automation_lane: lane,
       phase_target,
+      confidence_score: confidence,
       fields_requiring_review: fieldsToReview,
-      routing_reason: flags.length ? `Flags: ${flags.join(", ")}` : "No flags; confidence gated",
+      routing_reason,
+      deterministic_rule_exists: lane === "AUTO" ? "Y" : "",
+      sage_import_ready: lane === "AUTO",
+      sage_blockers: lane === "AUTO" ? [] : (fieldsToReview ? fieldsToReview.split(";") : ["Needs review"]),
+      needs_review_reason: lane === "AUTO" ? "" : routing_reason,
     };
   });
 }
 
-function esc(v: unknown) {
-  const s = v === null || v === undefined ? "" : String(v);
-  return `"${s.replace(/"/g, '""')}"`;
-}
-
 export function rowsToCsv(rows: POLineRow[]): string {
   if (!rows.length) return "";
-  const headers = Object.keys(rows[0]) as (keyof POLineRow)[];
+
+  // Expanded CSV to avoid “losing” key fields
+  const headers = [
+    "Doc ID","Doc Type","Customer","PO#","Line#",
+    "Item#","Desc","Qty","UOM","Price","Ext Price",
+    "Item Class","Edge1","Edge2","Edge3",
+    "Mfr Abbr","Mfr Full","Finish","Gordon Sym","Category","Subcat",
+    "Fields Requiring Review","Routing Reason","Confidence","Lane","Phase","Ready"
+  ];
+
   const lines = [
     headers.join(","),
-    ...rows.map(r => headers.map(h => esc(r[h])).join(",")),
+    ...rows.map(r => [
+      `"${(r.doc_id ?? "").replace(/"/g,'""')}"`,
+      `"${(r.doc_type ?? "UNKNOWN").replace(/"/g,'""')}"`,
+      `"${(r.customer_name ?? "").replace(/"/g,'""')}"`,
+      `"${(r.customer_po_number ?? "").replace(/"/g,'""')}"`,
+      r.line_no ?? "",
+      `"${(r.customer_item_no ?? "").replace(/"/g,'""')}"`,
+      `"${(r.description_raw ?? "").replace(/"/g,'""')}"`,
+      r.quantity ?? "",
+      `"${(r.uom_raw ?? "").replace(/"/g,'""')}"`,
+      r.unit_price ?? "",
+      r.extended_price ?? "",
+      `"${(r.item_class ?? "UNKNOWN").replace(/"/g,'""')}"`,
+      `"${(r.edge_case_flag_1 ?? "").replace(/"/g,'""')}"`,
+      `"${(r.edge_case_flag_2 ?? "").replace(/"/g,'""')}"`,
+      `"${(r.edge_case_flag_3 ?? "").replace(/"/g,'""')}"`,
+      `"${(r.manufacturer_abbr ?? "").replace(/"/g,'""')}"`,
+      `"${(r.manufacturer_full ?? "").replace(/"/g,'""')}"`,
+      `"${(r.finish_us_code ?? "").replace(/"/g,'""')}"`,
+      `"${(r.gordon_symbol ?? "").replace(/"/g,'""')}"`,
+      `"${(r.category ?? "").replace(/"/g,'""')}"`,
+      `"${(r.subcategory ?? "").replace(/"/g,'""')}"`,
+      `"${(r.fields_requiring_review ?? "").replace(/"/g,'""')}"`,
+      `"${(r.routing_reason ?? "").replace(/"/g,'""')}"`,
+      (typeof r.confidence_score === "number" ? r.confidence_score : (r.match_score ?? "")),
+      `"${(r.automation_lane ?? "ASSIST").replace(/"/g,'""')}"`,
+      r.phase_target ?? "",
+      (r.sage_import_ready ? "Y" : "N"),
+    ].join(",")),
   ];
+
   return lines.join("\n");
 }
 
@@ -152,50 +276,4 @@ export function downloadCsv(filename: string, csv: string) {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
-}
-
-/**
- * Standard XLSX download of the flattened rows.
- */
-export function downloadXlsx(filename: string, rows: POLineRow[]) {
-  if (!rows.length) return;
-  const worksheet = XLSX.utils.json_to_sheet(rows);
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, "Order Lines");
-  XLSX.writeFile(workbook, filename);
-}
-
-/**
- * Advanced Excel Export that follows the enterprise 'Control Surface' column mapping.
- */
-export function exportControlSurfaceXlsx(filename: string, rows: POLineRow[]) {
-  const mapped = rows.map(r => ({
-    "Doc ID": r.doc_id,
-    "Doc Type": r.doc_type,
-    "Customer": r.customer_name,
-    "PO Number": r.customer_po_number,
-    "Date": r.doc_date,
-    "Ship To (Raw)": r.ship_to_address_raw,
-    "Bill To (Raw)": r.bill_to_address_raw,
-    "Instructions": r.mark_instructions,
-    "Line #": r.line_no,
-    "Item #": r.item_no,
-    "Description": r.customer_item_desc_raw,
-    "Qty": r.qty,
-    "UOM": r.uom,
-    "Unit Price": r.unit_price,
-    "Total": r.extended_price,
-    "Lane": r.automation_lane,
-    "Class": r.item_class,
-    "Phase": r.phase_target,
-    "Confidence": Math.round(r.confidence_score * 100) + "%",
-    "Flags": [r.edge_case_flag_1, r.edge_case_flag_2, r.edge_case_flag_3].filter(Boolean).join("; "),
-    "Review Fields": r.fields_requiring_review,
-    "Reason": r.routing_reason
-  }));
-
-  const worksheet = XLSX.utils.json_to_sheet(mapped);
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, "Control_Surface");
-  XLSX.writeFile(workbook, filename);
 }

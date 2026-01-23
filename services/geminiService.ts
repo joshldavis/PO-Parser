@@ -1,63 +1,72 @@
+
 import { GoogleGenAI, Type } from "@google/genai";
 import { GeminiParsingResult } from "../types";
+import { ReferencePack } from "../referencePack.schema";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+// Initialize with named parameter and direct process.env reference as per guidelines
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 const DOCUMENT_SCHEMA = {
   type: Type.OBJECT,
   properties: {
     documentType: {
       type: Type.STRING,
-      description: "The type of document (Invoice, Sales Order, Purchase Order, Picking Sheet, etc.)",
+      description: "Document type: e.g., 'Purchase Order', 'Sales Order', 'Invoice'.",
     },
     orderNumber: {
       type: Type.STRING,
-      description: "The order or invoice number specific to this document",
+      description: "The primary reference number (Order #, PO #, Invoice #).",
     },
     orderDate: {
       type: Type.STRING,
-      description: "The date listed on this specific document",
+      description: "Date of issuance as written on the doc.",
     },
     customerName: {
       type: Type.STRING,
-      description: "The name of the customer or 'Sold To' party",
+      description: "Full name of the customer or purchasing entity.",
     },
     vendorName: {
       type: Type.STRING,
-      description: "The name of the vendor or issuing company",
+      description: "Full name of the seller or issuing entity.",
     },
     customerPO: {
       type: Type.STRING,
-      description: "The Customer PO number if available",
+      description: "Reference PO number provided by the customer.",
     },
     currency: {
       type: Type.STRING,
-      description: "The currency (e.g., USD, EUR)",
+      description: "ISO currency code or symbol found.",
     },
     billToAddressRaw: { 
       type: Type.STRING, 
-      description: "Raw bill-to block text including company name and address" 
+      description: "Complete Bill-To block text." 
     },
     shipToAddressRaw: { 
       type: Type.STRING, 
-      description: "Raw ship-to block text including company name and address" 
+      description: "Complete Ship-To block text." 
     },
     markInstructions: { 
       type: Type.STRING, 
-      description: "Any 'MARK:', delivery instructions, or special project notes" 
+      description: "Special 'MARK FOR' or delivery instructions." 
     },
     lineItems: {
       type: Type.ARRAY,
       items: {
         type: Type.OBJECT,
         properties: {
-          itemNumber: { type: Type.STRING },
-          description: { type: Type.STRING },
-          unit: { type: Type.STRING },
-          quantityOrdered: { type: Type.NUMBER },
-          quantityShipped: { type: Type.NUMBER },
-          unitPrice: { type: Type.NUMBER },
-          totalAmount: { type: Type.NUMBER },
+          itemNumber: { type: Type.STRING, description: "Part Number or SKU." },
+          description: { type: Type.STRING, description: "Full item description." },
+          unit: { type: Type.STRING, description: "UOM (EA, FT, PC, etc.)." },
+          quantityOrdered: { type: Type.NUMBER, description: "Total quantity ordered." },
+          quantityShipped: { type: Type.NUMBER, description: "Total quantity shipped/supplied." },
+          unitPrice: { type: Type.NUMBER, description: "Cost per single unit." },
+          totalAmount: { type: Type.NUMBER, description: "Line extension total." },
+          // Normalization hints
+          manufacturer: { type: Type.STRING, description: "Identified manufacturer from Ref Pack or text." },
+          finish: { type: Type.STRING, description: "Identified finish code (e.g. US26D)." },
+          category: { type: Type.STRING, description: "Identified hardware category." },
+          voltage: { type: Type.STRING, description: "Voltage if electrified (e.g. 12V, 24V)." },
+          failMode: { type: Type.STRING, description: "Fail Safe/Secure if applicable." },
         },
         required: ["itemNumber", "description"],
       },
@@ -71,31 +80,55 @@ const PARSER_SCHEMA = {
   properties: {
     documents: {
       type: Type.ARRAY,
-      description: "A list of all distinct documents found in the provided file.",
+      description: "A list of distinct business documents extracted from the file.",
       items: DOCUMENT_SCHEMA,
     }
   },
   required: ["documents"]
 };
 
-export async function parseDocument(fileBase64: string, mimeType: string, ocrText?: string): Promise<GeminiParsingResult> {
+export async function parseDocument(
+  fileBase64: string, 
+  mimeType: string, 
+  ocrText?: string,
+  refPack?: ReferencePack
+): Promise<GeminiParsingResult> {
+  
+  let refContext = '';
+  if (refPack) {
+    refContext = `
+    INDUSTRIAL KNOWLEDGE BASE (Reference Pack v${refPack.version}):
+    - Known Manufacturers (Use these names/abbr): ${refPack.manufacturers.map(m => `${m.name} (${m.abbr})`).join(', ')}
+    - Standard Finishes: ${refPack.finishes.map(f => f.us_code).join(', ')}
+    - Hardware Categories: ${refPack.categories.map(c => c.category).join(', ')}
+    
+    INSTRUCTION: Use this context to cross-reference and NORMALIZE the extracted data. 
+    If you see 'LCN' in a description, set manufacturer to 'LCN'. 
+    If you see 'Satin Chrome' or '626', map finish to 'US26D'.
+    `;
+  }
+
+  // Use gemini-3-pro-preview for complex reasoning tasks like document extraction and normalization
   const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
+    model: "gemini-3-pro-preview",
     contents: [
       {
         parts: [
           {
-            text: `This file contains one or more documents related to a purchase or sales process. 
-            ${ocrText ? `PRE-EXTRACTED OCR TEXT HINT: 
-            ---
-            ${ocrText}
-            ---
-            Use the text above to help clarify blurry parts of the document image.` : ''}
+            text: `ACT AS A SENIOR ENTERPRISE DOCUMENT ANALYST.
+            Goal: Extract all line items and normalize them for ERP import.
+            
+            Instructions:
+            1. Extract header details: Entities, Addresses, PO/Order IDs.
+            2. Extract ALL line items accurately.
+            3. Populate normalization fields (manufacturer, finish, category) by matching text patterns against the provided reference knowledge.
+            4. Merge multi-line descriptions into a single clean string.
 
-            Please scan ALL pages/parts. 
-            Identify each distinct document (Invoice, Sales Order, Purchase Order, Picking Sheet). 
-            For EACH document, extract header info, addresses (bill-to/ship-to), instructions, and line items.
-            Return the data flattened into the provided JSON schema.`
+            ${refContext}
+
+            ${ocrText ? `OCR HINT:\n---\n${ocrText}\n---` : ''}
+
+            Output must be valid JSON following the provided schema.`
           },
           {
             inlineData: {
@@ -109,17 +142,18 @@ export async function parseDocument(fileBase64: string, mimeType: string, ocrTex
     config: {
       responseMimeType: "application/json",
       responseSchema: PARSER_SCHEMA,
+      temperature: 0.1,
     },
   });
 
   if (!response.text) {
-    throw new Error("No response from Gemini API");
+    throw new Error("Empty response from AI engine");
   }
 
   try {
     return JSON.parse(response.text.trim()) as GeminiParsingResult;
   } catch (e) {
-    console.error("JSON Parse Error:", e, response.text);
-    throw new Error("Failed to parse AI response into valid JSON");
+    console.error("JSON Parsing failed", e, response.text);
+    throw new Error("AI returned invalid JSON.");
   }
 }

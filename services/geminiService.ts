@@ -86,17 +86,33 @@ const PARSER_SCHEMA = {
 };
 
 /**
- * Helper to handle API resilience with exponential backoff
+ * Enhanced retry helper for 429 Resource Exhausted errors.
+ * Uses a 10s base delay for rate limits to ensure the window resets.
  */
-async function withRetry<T>(fn: () => Promise<T>, retries = 3, delay = 2000): Promise<T> {
+async function withRetry<T>(fn: () => Promise<T>, onRetry?: (msg: string) => void, retries = 5, delay = 10000): Promise<T> {
   try {
     return await fn();
   } catch (error: any) {
-    const isRetryable = error?.status === 429 || error?.message?.includes("429") || error?.message?.includes("RESOURCE_EXHAUSTED");
-    if (isRetryable && retries > 0) {
-      console.warn(`Rate limit hit. Retrying in ${delay}ms... (${retries} retries left)`);
+    const errorStr = JSON.stringify(error).toUpperCase();
+    const messageStr = (error?.message || "").toUpperCase();
+    
+    const isRateLimit = 
+      error?.status === 429 || 
+      error?.error?.code === 429 ||
+      errorStr.includes("429") || 
+      errorStr.includes("RESOURCE_EXHAUSTED") ||
+      messageStr.includes("429") ||
+      messageStr.includes("RESOURCE_EXHAUSTED") ||
+      messageStr.includes("QUOTA");
+
+    if (isRateLimit && retries > 0) {
+      const waitTime = Math.round(delay / 1000);
+      const waitMsg = `Quota reached. Waiting ${waitTime}s for reset...`;
+      if (onRetry) onRetry(waitMsg);
+      console.warn(waitMsg);
       await new Promise(resolve => setTimeout(resolve, delay));
-      return withRetry(fn, retries - 1, delay * 2);
+      // Exponentially increase delay for subsequent rate limits
+      return withRetry(fn, onRetry, retries - 1, delay * 1.5);
     }
     throw error;
   }
@@ -106,71 +122,65 @@ export async function parseDocument(
   fileBase64: string, 
   mimeType: string, 
   ocrText?: string,
-  refPack?: ReferencePack
+  refPack?: ReferencePack,
+  onStatusUpdate?: (status: string) => void
 ): Promise<GeminiParsingResult> {
   
   let refContext = '';
   if (refPack) {
     refContext = `
     INDUSTRIAL KNOWLEDGE BASE (Reference Pack v${refPack.version}):
-    - Known Manufacturers (Use these names/abbr): ${refPack.manufacturers.map(m => `${m.name} (${m.abbr})`).join(', ')}
+    - Known Manufacturers: ${refPack.manufacturers.map(m => `${m.name} (${m.abbr})`).join(', ')}
     - Standard Finishes: ${refPack.finishes.map(f => f.us_code).join(', ')}
     - Hardware Categories: ${refPack.categories.map(c => c.category).join(', ')}
     
-    INSTRUCTION: Use this context to cross-reference and NORMALIZE the extracted data. 
-    If you see 'LCN' in a description, set manufacturer to 'LCN'. 
-    If you see 'Satin Chrome' or '626', map finish to 'US26D'.
+    INSTRUCTION: Normalize extracted data against this KB.
     `;
   }
 
-  // Fix: Explicitly typing the response as GenerateContentResponse to fix property access errors on 'unknown' type.
-  const response: GenerateContentResponse = await withRetry(() => ai.models.generateContent({
-    model: "gemini-3-pro-preview",
-    contents: [
-      {
-        parts: [
-          {
-            text: `ACT AS A SENIOR ENTERPRISE DOCUMENT ANALYST.
-            Goal: Extract all line items and normalize them for ERP import.
-            
-            Instructions:
-            1. Extract header details: Entities, Addresses, PO/Order IDs.
-            2. Extract ALL line items accurately.
-            3. Populate normalization fields (manufacturer, finish, category) by matching text patterns against the provided reference knowledge.
-            4. Merge multi-line descriptions into a single clean string.
+  const response: GenerateContentResponse = await withRetry(
+    () => ai.models.generateContent({
+      // Switched to Flash for better rate limit tolerance in batch scenarios
+      model: "gemini-3-flash-preview",
+      contents: [
+        {
+          parts: [
+            {
+              text: `EXTRACT DATA:
+              1. Header details (IDs, Dates, Entities).
+              2. ALL line items.
+              3. Normalize Mfr/Finish/Category based on context.
 
-            ${refContext}
+              ${refContext}
+              ${ocrText ? `OCR HINT:\n${ocrText}` : ''}
 
-            ${ocrText ? `OCR HINT:\n---\n${ocrText}\n---` : ''}
-
-            Output must be valid JSON following the provided schema.`
-          },
-          {
-            inlineData: {
-              data: fileBase64,
-              mimeType: mimeType,
+              Return JSON following schema.`
             },
-          },
-        ],
+            {
+              inlineData: {
+                data: fileBase64,
+                mimeType: mimeType,
+              },
+            },
+          ],
+        },
+      ],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: PARSER_SCHEMA,
+        temperature: 0.1,
       },
-    ],
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: PARSER_SCHEMA,
-      temperature: 0.1,
-    },
-  }));
+    }),
+    onStatusUpdate
+  );
 
-  // Fix: Property 'text' is accessible after proper typing of GenerateContentResponse
   if (!response.text) {
     throw new Error("Empty response from AI engine");
   }
 
   try {
-    // Fix: Access .text property directly to get response string as per Gemini API guidelines
     return JSON.parse(response.text.trim()) as GeminiParsingResult;
   } catch (e) {
-    // Fix: Accessing .text for error reporting
     console.error("JSON Parsing failed", e, response.text);
     throw new Error("AI returned invalid JSON.");
   }

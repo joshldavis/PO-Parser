@@ -1,4 +1,3 @@
-
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { POLineRow, GeminiParsingResult } from './types';
 import { ReferencePack } from './referencePack.schema';
@@ -15,26 +14,28 @@ import { exportPolicyToXlsxTemplate, importPolicyFromXlsx } from './services/pol
 import { PolicyAdmin } from './components/PolicyAdmin';
 import { ControlSurfacePolicy } from './policy/controlSurfacePolicy';
 import { applyPolicyRouting } from './services/policyRouting';
+import { loadReferencePack, saveReferencePack as persistReferencePack } from './reference/referenceLocalStore';
+import { ReferencePackAdmin } from './components/ReferencePackAdmin';
 
 declare const Tesseract: any;
 
 const App: React.FC = () => {
   const [currentPolicy, setCurrentPolicy] = useState<ControlSurfacePolicy>(() => loadPolicy());
+  const [referencePack, setReferencePack] = useState<ReferencePack>(() => loadReferencePack());
   const [rows, setRows] = useState<POLineRow[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingStatus, setProcessingStatus] = useState<string>('');
   const [progress, setProgress] = useState(0);
   const [controlTemplateFile, setControlTemplateFile] = useState<File | null>(null);
-  const [referencePack, setReferencePack] = useState<ReferencePack | null>(null);
   const [isDragging, setIsDragging] = useState(false);
-  const [activeTab, setActiveTab] = useState<'ops' | 'policy'>('ops');
+  const [activeTab, setActiveTab] = useState<'ops' | 'policy' | 'reference'>('ops');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const templateInputRef = useRef<HTMLInputElement>(null);
-  const refPackInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setCurrentPolicy(loadPolicy());
+    setReferencePack(loadReferencePack());
   }, []);
 
   const processFiles = async (files: FileList) => {
@@ -46,6 +47,12 @@ const App: React.FC = () => {
       const fileStem = file.name.replace(/\.[^/.]+$/, "");
       const stepSize = 100 / files.length;
       const baseProgress = (i / files.length) * 100;
+
+      // PROACTIVE PACING: Add a mandatory 5s gap to prevent 429s
+      if (i > 0) {
+        setProcessingStatus(`Pacing for API Quota (5s)...`);
+        await new Promise(r => setTimeout(r, 5000));
+      }
 
       try {
         let ocrTextHint = '';
@@ -68,7 +75,8 @@ const App: React.FC = () => {
           base64, 
           file.type, 
           ocrTextHint, 
-          referencePack || undefined
+          referencePack || undefined,
+          (status) => setProcessingStatus(`${file.name}: ${status}`)
         );
         
         let mappedRows = geminiResultToPOLineRows({ 
@@ -78,7 +86,7 @@ const App: React.FC = () => {
           refPack: referencePack
         });
 
-        if (referencePack) {
+        if (referencePack && referencePack.manufacturers.length > 0) {
           const refService = new ReferenceService(referencePack);
           mappedRows = enrichAndValidate(mappedRows, refService, referencePack.version);
         }
@@ -87,11 +95,13 @@ const App: React.FC = () => {
 
       } catch (error: any) {
         console.error(`Error processing ${file.name}:`, error);
-        const msg = error?.message || "";
-        if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) {
-          alert(`Rate limit exceeded for ${file.name}. Please wait a moment and try again with fewer files.`);
+        const errorMsg = JSON.stringify(error);
+        
+        if (errorMsg.includes("429") || errorMsg.includes("RESOURCE_EXHAUSTED")) {
+          setProcessingStatus(`Quota Fully Exhausted for ${file.name}`);
+          alert(`API Rate Limit reached. ${file.name} was skipped. Please wait 60 seconds before trying again.`);
         } else {
-          alert(`Could not process ${file.name}. Check your connection or API configuration.`);
+          alert(`Could not process ${file.name}: ${error?.message || "Check console"}`);
         }
       }
       
@@ -110,27 +120,6 @@ const App: React.FC = () => {
     const updated = applyPolicyRouting(rows, currentPolicy, { phase: "PHASE_1" });
     setRows(updated);
   }, [rows, currentPolicy]);
-
-  const handleRefPackUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const json = JSON.parse(e.target?.result as string) as ReferencePack;
-        if (json.version && Array.isArray(json.manufacturers)) {
-          setReferencePack(json);
-          alert(`Reference Pack v${json.version} loaded successfully!`);
-        } else {
-          throw new Error("Invalid format");
-        }
-      } catch (err) {
-        alert("Failed to load reference pack: JSON structure invalid.");
-      }
-    };
-    reader.readAsText(file);
-  };
 
   const handleTemplateUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -227,7 +216,14 @@ const App: React.FC = () => {
               className={`flex items-center gap-2 px-5 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'policy' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
             >
               <i className="fa-solid fa-shield-halved"></i>
-              Policy Admin
+              Policy
+            </button>
+            <button 
+              onClick={() => setActiveTab('reference')}
+              className={`flex items-center gap-2 px-5 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'reference' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              <i className="fa-solid fa-book"></i>
+              Knowledge
             </button>
           </nav>
 
@@ -235,9 +231,9 @@ const App: React.FC = () => {
             {activeTab === 'ops' ? (
               <>
                 <div className="hidden lg:flex items-center gap-2 bg-white border border-slate-200 px-3 py-1.5 rounded-xl shadow-sm">
-                  <button onClick={() => refPackInputRef.current?.click()} className={`text-[10px] font-bold transition-all flex items-center gap-1.5 px-2 py-0.5 rounded-lg ${referencePack ? 'text-indigo-700 bg-indigo-50' : 'text-slate-500 bg-slate-50 hover:bg-slate-100'}`}>
-                    <i className={`fa-solid ${referencePack ? 'fa-book-bookmark' : 'fa-book'}`}></i>
-                    <span>{referencePack ? `KB v${referencePack.version}` : 'Ref Pack'}</span>
+                  <button onClick={() => setActiveTab('reference')} className={`text-[10px] font-bold transition-all flex items-center gap-1.5 px-2 py-0.5 rounded-lg ${referencePack.manufacturers.length > 0 ? 'text-indigo-700 bg-indigo-50' : 'text-slate-500 bg-slate-50 hover:bg-slate-100'}`}>
+                    <i className={`fa-solid ${referencePack.manufacturers.length > 0 ? 'fa-book-bookmark' : 'fa-book'}`}></i>
+                    <span>{referencePack.manufacturers.length > 0 ? `KB v${referencePack.version}` : 'No KB'}</span>
                   </button>
                   <button onClick={() => templateInputRef.current?.click()} className={`text-[10px] font-bold transition-all flex items-center gap-1.5 px-2 py-0.5 rounded-lg ${controlTemplateFile ? 'text-emerald-700 bg-emerald-50' : 'text-slate-500 bg-slate-50 hover:bg-slate-100'}`}>
                     <i className={`fa-solid ${controlTemplateFile ? 'fa-file-circle-check' : 'fa-file-excel'}`}></i>
@@ -248,7 +244,6 @@ const App: React.FC = () => {
                     <i className="fa-solid fa-rotate"></i>
                     <span>Re-Route</span>
                   </button>
-                  <input type="file" ref={refPackInputRef} onChange={handleRefPackUpload} className="hidden" accept=".json" />
                   <input type="file" ref={templateInputRef} onChange={handleTemplateUpload} className="hidden" accept=".xlsx" />
                 </div>
                 <button onClick={() => fileInputRef.current?.click()} disabled={isProcessing} className="group flex items-center gap-2 px-6 py-2.5 bg-slate-900 text-white rounded-2xl font-bold hover:bg-blue-600 transition-all shadow-xl active:scale-95">
@@ -265,10 +260,15 @@ const App: React.FC = () => {
                   </button>
                 </div>
               </>
-            ) : (
+            ) : activeTab === 'policy' ? (
                <div className="flex items-center gap-2 bg-indigo-50 px-4 py-2 rounded-2xl border border-indigo-100">
                   <i className="fa-solid fa-circle-info text-indigo-400 text-xs"></i>
-                  <span className="text-xs font-bold text-indigo-700">Dynamic Rule Testing: Modify rules and click "Re-Route" in Ops to see changes.</span>
+                  <span className="text-xs font-bold text-indigo-700">Automation Policy: Define how orders are routed based on detected attributes.</span>
+               </div>
+            ) : (
+                <div className="flex items-center gap-2 bg-emerald-50 px-4 py-2 rounded-2xl border border-emerald-100">
+                  <i className="fa-solid fa-graduation-cap text-emerald-400 text-xs"></i>
+                  <span className="text-xs font-bold text-emerald-700">Master Knowledge Base: Manage manufacturers, finishes, and catalog standards.</span>
                </div>
             )}
           </div>
@@ -291,8 +291,8 @@ const App: React.FC = () => {
                      </div>
                   </div>
                   <div className="space-y-2">
-                    <h3 className="text-3xl font-black text-slate-900">{processingStatus}</h3>
-                    <p className="text-slate-400 font-medium tracking-tight">Enterprise Data Extraction via Gemini 3 Pro</p>
+                    <h3 className="text-2xl font-black text-slate-900">{processingStatus}</h3>
+                    <p className="text-slate-400 font-medium tracking-tight">High-Throughput Gemini Flash Extraction</p>
                   </div>
                   <div className="w-full max-w-lg">
                     <div className="bg-slate-100 rounded-full h-5 p-1.5 shadow-inner">
@@ -324,8 +324,10 @@ const App: React.FC = () => {
               </div>
             )}
           </>
-        ) : (
+        ) : activeTab === 'policy' ? (
           <PolicyAdmin policy={currentPolicy} onPolicyChange={setCurrentPolicy} />
+        ) : (
+          <ReferencePackAdmin referencePack={referencePack} onReferencePackChange={setReferencePack} />
         )}
       </main>
     </div>

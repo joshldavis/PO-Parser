@@ -37,6 +37,8 @@ export interface HardwareSetTemplate {
 
 export interface ReferencePack {
   version: string
+  updated_at?: string
+  changelog?: string[]
   manufacturers: ManufacturerRef[]
   finishes: FinishRef[]
   categories: CategoryRef[]

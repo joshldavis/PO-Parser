@@ -6,16 +6,22 @@ interface DataTableProps {
   onDelete: (index: number) => void;
 }
 
-const Tooltip = ({ children, position = 'bottom', className = '' }: { children?: React.ReactNode, position?: 'top' | 'bottom' | 'left', className?: string }) => {
+const Tooltip = ({ children, position = 'bottom', align = 'center', className = '' }: { children?: React.ReactNode, position?: 'top' | 'bottom' | 'left', align?: 'center' | 'left' | 'right', className?: string }) => {
+  const alignClasses = {
+    center: 'left-1/2 -translate-x-1/2',
+    left: 'left-0 translate-x-0',
+    right: 'right-0 translate-x-0'
+  };
+
   const positionClasses = {
-    top: 'bottom-full mb-3 left-1/2 -translate-x-1/2',
-    bottom: 'top-full mt-3 left-1/2 -translate-x-1/2',
+    top: `bottom-full mb-3 ${alignClasses[align]}`,
+    bottom: `top-full mt-3 ${alignClasses[align]}`,
     left: 'right-full mr-3 top-0'
   };
 
   const arrowClasses = {
-    top: 'top-full left-1/2 -translate-x-1/2 border-t-slate-900',
-    bottom: 'bottom-full left-1/2 -translate-x-1/2 border-b-slate-900',
+    top: `top-full ${align === 'center' ? 'left-1/2 -translate-x-1/2' : align === 'left' ? 'left-4' : 'right-4'} border-t-slate-900`,
+    bottom: `bottom-full ${align === 'center' ? 'left-1/2 -translate-x-1/2' : align === 'left' ? 'left-4' : 'right-4'} border-b-slate-900`,
     left: 'left-full top-2 border-l-slate-900'
   };
 
@@ -27,12 +33,12 @@ const Tooltip = ({ children, position = 'bottom', className = '' }: { children?:
   );
 };
 
-const HeaderInfo = ({ title, description, details }: { title: string, description: string, details?: string[] }) => (
+const HeaderInfo = ({ title, description, details, align = 'center' }: { title: string, description: string, details?: string[], align?: 'center' | 'left' | 'right' }) => (
   <div className="group relative inline-flex items-center ml-2 cursor-help align-middle">
     <div className="flex items-center justify-center w-5 h-5 rounded-full bg-slate-200/50 group-hover:bg-blue-100 transition-all duration-300">
       <i className="fa-solid fa-info text-[9px] text-slate-500 group-hover:text-blue-600"></i>
     </div>
-    <Tooltip position="bottom" className="ring-1 ring-white/20">
+    <Tooltip position="bottom" align={align} className="ring-1 ring-white/20">
       <div className="mb-2 pb-2 border-b border-white/10">
         <h4 className="text-blue-400 font-black uppercase tracking-widest text-[10px]">{title}</h4>
       </div>
@@ -76,7 +82,7 @@ const DataTable: React.FC<DataTableProps> = ({ data, onDelete }) => {
 
   return (
     <div className="bg-white rounded-3xl shadow-2xl shadow-slate-200/40 border border-slate-200 overflow-visible">
-      <div className="overflow-x-auto rounded-3xl">
+      <div className="overflow-x-auto rounded-3xl pb-20 -mb-20">
         <table className="min-w-full divide-y divide-slate-100 text-left">
           <thead className="bg-slate-50/80 sticky top-0 z-20 backdrop-blur-sm">
             <tr>
@@ -85,6 +91,7 @@ const DataTable: React.FC<DataTableProps> = ({ data, onDelete }) => {
                 <HeaderInfo 
                   title="Pipeline Lane & Sync" 
                   description="Determines how the order is routed through the automation engine." 
+                  align="left"
                   details={[
                     "AUTO: 90%+ confidence with zero policy violations.",
                     "REVIEW: Needs human verification due to low score or edge cases.",
@@ -154,6 +161,7 @@ const DataTable: React.FC<DataTableProps> = ({ data, onDelete }) => {
                 <HeaderInfo 
                   title="AI Confidence Index" 
                   description="Overall certainty of the data extraction and grounding result." 
+                  align="right"
                   details={[
                     ">90%: High reliability, candidate for AUTO routing.",
                     "<70%: Potential OCR noise or catalog mismatch.",

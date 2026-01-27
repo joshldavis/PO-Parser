@@ -15,34 +15,34 @@ const SHEETS = {
  * Common aliases for sheet names to make import more user-friendly.
  */
 const SHEET_ALIASES: Record<string, string[]> = {
-  [SHEETS.MANUFACTURERS]: ["manufacturer", "mfr", "mfrs", "manufacturers", "mfg", "mfgs", "brands"],
-  [SHEETS.FINISHES]: ["finish", "finishes", "pallete", "color", "colors"],
-  [SHEETS.CATEGORIES]: ["category", "categories", "cat", "cats", "mapping"],
-  [SHEETS.ELECTRIFIED]: ["electrified", "electrifieddevice", "electrifieddevices", "devices", "device", "power"],
-  [SHEETS.WIRING]: ["wiring", "wiringconfig", "wiringconfigs", "wiring_configs", "cables"],
-  [SHEETS.SETS]: ["set", "sets", "hardwaresets", "templates", "template", "hardware_sets"]
+  [SHEETS.MANUFACTURERS]: ["manufacturer", "mfr", "mfrs", "manufacturers", "mfg", "mfgs", "brands", "mfr list", "mfrs list"],
+  [SHEETS.FINISHES]: ["finish", "finishes", "pallete", "color", "colors", "finish list"],
+  [SHEETS.CATEGORIES]: ["category", "categories", "cat", "cats", "mapping", "hardware types"],
+  [SHEETS.ELECTRIFIED]: ["electrified", "electrifieddevice", "electrifieddevices", "devices", "device", "power", "elec"],
+  [SHEETS.WIRING]: ["wiring", "wiringconfig", "wiringconfigs", "wiring_configs", "cables", "wiring logic"],
+  [SHEETS.SETS]: ["set", "sets", "hardwaresets", "templates", "template", "hardware_sets", "hw sets"]
 };
 
 /**
  * Intelligent header matching synonyms.
  */
 const COLUMN_ALIASES = {
-  abbr: ["abbr", "abbreviation", "code", "mfr_code", "prefix"],
-  name: ["name", "description", "manufacturer", "mfr", "full_name"],
-  aliases: ["aliases", "alias", "synonyms", "search_terms", "keywords"],
-  us_code: ["us_code", "us", "finish_code", "finish", "code"],
-  bhma_code: ["bhma_code", "bhma", "ansi_code", "ansi"],
-  gordon_symbol: ["gordon_symbol", "symbol", "key", "id", "mapping_id"],
-  category: ["category", "cat", "group"],
-  subcategory: ["subcategory", "subcat", "subgroup"],
-  device_type: ["device_type", "type", "hardware_type", "device"],
-  voltage: ["voltage", "volts", "v", "power_req"],
-  fail_modes: ["fail_modes", "fail_mode", "failsafe", "operation"],
-  keywords: ["keywords", "keyword", "search", "tags"],
-  device_types: ["device_types", "devices", "compatible_devices"],
-  wire_count: ["wire_count", "wires", "conductors"],
-  template_id: ["template_id", "id", "template", "set_id"],
-  defaults_json: ["defaults_json", "defaults", "config_json", "json"]
+  abbr: ["abbr", "abbreviation", "code", "mfr_code", "prefix", "mfr code", "mfrabbr"],
+  name: ["name", "description", "manufacturer", "mfr", "full_name", "manufacturer name", "mfr name"],
+  aliases: ["aliases", "alias", "synonyms", "search_terms", "keywords", "other names"],
+  us_code: ["us_code", "us", "finish_code", "finish", "code", "us code", "finish code"],
+  bhma_code: ["bhma_code", "bhma", "ansi_code", "ansi", "bhma code", "ansi code"],
+  gordon_symbol: ["gordon_symbol", "symbol", "key", "id", "mapping_id", "gordon code", "symbol code"],
+  category: ["category", "cat", "group", "hardware category"],
+  subcategory: ["subcategory", "subcat", "subgroup", "hardware subcategory"],
+  device_type: ["device_type", "type", "hardware_type", "device", "device type"],
+  voltage: ["voltage", "volts", "v", "power_req", "power"],
+  fail_modes: ["fail_modes", "fail_mode", "failsafe", "operation", "fail safe"],
+  keywords: ["keywords", "keyword", "search", "tags", "terms"],
+  device_types: ["device_types", "devices", "compatible_devices", "device types"],
+  wire_count: ["wire_count", "wires", "conductors", "wire count"],
+  template_id: ["template_id", "id", "template", "set_id", "set code", "template id"],
+  defaults_json: ["defaults_json", "defaults", "config_json", "json", "set defaults"]
 };
 
 function listToCsv(list?: string[]): string {
@@ -52,21 +52,28 @@ function listToCsv(list?: string[]): string {
 
 function csvToList(s?: any): string[] {
   if (s === undefined || s === null || s === "") return [];
-  // Support both comma and semicolon separators
   return String(s).split(/[,;]/).map(x => x.trim()).filter(Boolean);
 }
 
 /**
  * Robustly matches an object property based on a list of potential names.
+ * Improved to handle partial matches like "Manufacturer Name" matching target "manufacturer".
  */
-function getVal(obj: any, keys: string[]): any {
+function getVal(obj: any, targetKeys: string[]): any {
   if (!obj) return undefined;
   const objKeys = Object.keys(obj);
-  const normalizedTargets = keys.map(n => n.toLowerCase().replace(/[^a-z0-9]/g, ''));
+  const normalizedTargets = targetKeys.map(n => n.toLowerCase().replace(/[^a-z0-9]/g, ''));
   
   for (const k of objKeys) {
     const normalizedK = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+    
+    // 1. Exact match (e.g., "mfr" === "mfr")
     if (normalizedTargets.includes(normalizedK)) {
+      return obj[k];
+    }
+    
+    // 2. Partial match (e.g., "manufacturername" contains "manufacturer")
+    if (normalizedTargets.some(t => normalizedK.includes(t) || t.includes(normalizedK))) {
       return obj[k];
     }
   }
@@ -127,9 +134,17 @@ export function exportReferencePackToXlsx(pack: ReferencePack): Blob {
 }
 
 export function importReferencePackFromXlsx(buffer: ArrayBuffer, existingPack: ReferencePack): ReferencePack {
-  console.log("Parsing XLSX buffer...");
-  const wb = XLSX.read(buffer, { type: "array" });
-  console.log("Workbook sheets found:", wb.SheetNames);
+  console.log("%c[KB IMPORT] Starting XLSX Parsing...", "color: #4f46e5; font-weight: bold;");
+  
+  let wb;
+  try {
+    wb = XLSX.read(buffer, { type: "array" });
+  } catch (err) {
+    console.error("XLSX read failed:", err);
+    throw new Error("Failed to read Excel file format. Ensure it is a valid .xlsx file.");
+  }
+
+  console.log("Found Sheets:", wb.SheetNames);
   
   const findSheetName = (target: string): string | undefined => {
     const lowerTarget = target.toLowerCase();
@@ -150,12 +165,16 @@ export function importReferencePackFromXlsx(buffer: ArrayBuffer, existingPack: R
   const getSheetData = <T>(name: string): T[] => {
     const actualName = findSheetName(name);
     if (!actualName) {
-      console.warn(`Skipping sheet '${name}': Not found in Excel file.`);
+      console.warn(`%cSheet '${name}' not found. Checked aliases: ${SHEET_ALIASES[name]?.join(', ') || 'none'}`, "color: #94a3b8;");
       return [];
     }
     const ws = wb.Sheets[actualName];
+    // sheet_to_json is robust for finding the first row with content as headers
     const data = XLSX.utils.sheet_to_json<T>(ws, { defval: "" });
-    console.log(`Sheet '${actualName}' loaded with ${data.length} rows.`);
+    console.log(`%cLoaded '${actualName}' (${data.length} rows)`, "color: #10b981;");
+    if (data.length > 0) {
+      console.log("Headers detected:", Object.keys(data[0]));
+    }
     return data;
   };
 
@@ -193,7 +212,7 @@ export function importReferencePackFromXlsx(buffer: ArrayBuffer, existingPack: R
   const hardware_sets = getSheetData<any>(SHEETS.SETS).map(r => {
     let defaults = {};
     const dJson = getVal(r, COLUMN_ALIASES.defaults_json);
-    if (dJson) {
+    if (dJson && dJson !== "") {
        try {
          defaults = typeof dJson === 'string' ? JSON.parse(dJson) : dJson;
        } catch {
@@ -207,7 +226,7 @@ export function importReferencePackFromXlsx(buffer: ArrayBuffer, existingPack: R
     };
   }).filter(s => s.template_id);
 
-  return {
+  const finalPack = {
     ...existingPack,
     manufacturers,
     finishes,
@@ -217,4 +236,7 @@ export function importReferencePackFromXlsx(buffer: ArrayBuffer, existingPack: R
     hardware_sets,
     updated_at: new Date().toISOString()
   };
+
+  console.log("%c[KB IMPORT] Finished.", "color: #4f46e5; font-weight: bold;");
+  return finalPack;
 }

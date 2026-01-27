@@ -1,9 +1,12 @@
 // components/ReferencePackAdmin.tsx
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { ReferencePack } from "../referencePack.schema";
 import { saveReferencePack, clearReferencePack, EMPTY_REFERENCE_PACK } from "../reference/referenceLocalStore";
 import { finalizeReferencePack } from "../reference/referenceVersioning";
 import { exportReferencePackToXlsx, importReferencePackFromXlsx } from "../services/referencePackXlsx";
+
+// Simple check for XLSX global if needed
+declare const XLSX: any;
 
 type Props = {
   referencePack: ReferencePack;
@@ -15,11 +18,22 @@ export function ReferencePackAdmin({ referencePack, onReferencePackChange }: Pro
   const [isImporting, setIsImporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Debug: Check if XLSX is actually loaded in the environment
+  useEffect(() => {
+    try {
+      if (typeof XLSX !== 'undefined') {
+        console.log("XLSX Library loaded and ready.");
+      }
+    } catch (e) {
+      console.warn("XLSX global check failed (using module import instead).");
+    }
+  }, []);
+
   async function handleSave(kind: "patch" | "minor" | "major") {
     const finalized = finalizeReferencePack(referencePack, kind);
     saveReferencePack(finalized);
     onReferencePackChange(finalized);
-    alert(`Reference Pack v${finalized.version} saved to local storage.`);
+    alert(`Input Catalogue v${finalized.version} saved permanently to local storage.`);
   }
 
   async function handleExport() {
@@ -28,7 +42,7 @@ export function ReferencePackAdmin({ referencePack, onReferencePackChange }: Pro
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `OrderFlow_KB_v${referencePack.version}_${new Date().toISOString().split('T')[0]}.xlsx`;
+      a.download = `OrderFlow_Catalogue_v${referencePack.version}_${new Date().toISOString().split('T')[0]}.xlsx`;
       a.click();
       URL.revokeObjectURL(url);
     } catch (err: any) {
@@ -37,18 +51,18 @@ export function ReferencePackAdmin({ referencePack, onReferencePackChange }: Pro
   }
 
   async function handleImport() {
-    console.log("Import process triggered.");
+    console.log("Import button clicked.");
     if (!importFile) {
-      alert("Please select an XLSX file first using the file browser.");
+      alert("Please select an Excel file (.xlsx) first.");
       return;
     }
     
     setIsImporting(true);
-    console.log("Starting buffer read for:", importFile.name);
+    console.log("Starting import for:", importFile.name);
 
     try {
       const buffer = await importFile.arrayBuffer();
-      console.log("Buffer read success. Byte size:", buffer.byteLength);
+      console.log("File buffer created, length:", buffer.byteLength);
       
       const updated = importReferencePackFromXlsx(buffer, referencePack);
       
@@ -64,21 +78,21 @@ export function ReferencePackAdmin({ referencePack, onReferencePackChange }: Pro
       const totalItems = Object.values(counts).reduce((a, b) => a + b, 0);
 
       if (totalItems === 0) {
-        alert("Warning: The file was read, but no valid items were found in recognized sheets.\n\nMake sure your sheet names are similar to 'Manufacturers', 'Finishes', etc.");
+        alert("Import finished, but 0 items were found.\n\nVerify that your sheet names match (e.g., 'Manufacturers') and that column headers exist in the first row.");
       } else {
         onReferencePackChange(updated);
-        alert(`Success! Imported ${totalItems} items:\n- ${counts.mfrs} Manufacturers\n- ${counts.finishes} Finishes\n- ${counts.cats} Categories\n- ${counts.devices} Devices\n- ${counts.wiring} Wiring\n- ${counts.sets} Templates\n\nClick 'Patch' to save changes.`);
+        alert(`Successfully imported ${totalItems} items into the Catalogue!\n\nCheck the stats grid to verify counts.\n\nIMPORTANT: Click 'Patch' or 'Minor' save buttons above to commit this catalogue to your storage.`);
       }
     } catch (err: any) {
       console.error("Critical Import Error:", err);
-      alert(`Import failed: ${err.message || 'Unknown error occurred during parsing.'}`);
+      alert(`Import failed: ${err.message || 'An unexpected error occurred during Excel parsing.'}`);
     } finally {
       setIsImporting(false);
     }
   }
 
   function handleReset() {
-    if (confirm("Are you sure? This will wipe the current Knowledge Base from storage.")) {
+    if (confirm("Are you sure? This will wipe the entire Input Catalogue. You should export it first if you want to keep a copy.")) {
       clearReferencePack();
       onReferencePackChange(EMPTY_REFERENCE_PACK);
     }
@@ -104,10 +118,10 @@ export function ReferencePackAdmin({ referencePack, onReferencePackChange }: Pro
             <div className="bg-indigo-600 text-white w-8 h-8 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/30">
               <i className="fa-solid fa-book-bookmark text-sm"></i>
             </div>
-            Industrial Knowledge Base
+            Input Catalogue / Grounding Engine
           </h2>
           <p className="text-xs text-slate-500 font-medium mt-1">
-            KB Version: <span className="font-bold text-indigo-600">{referencePack.version}</span> • 
+            Catalogue Version: <span className="font-bold text-indigo-600">{referencePack.version}</span> • 
             Last Updated: <span className="font-bold text-slate-400">{referencePack.updated_at ? new Date(referencePack.updated_at).toLocaleString() : 'Never'}</span>
           </p>
         </div>
@@ -140,7 +154,7 @@ export function ReferencePackAdmin({ referencePack, onReferencePackChange }: Pro
                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1">Update Master Data</label>
                <h4 className="text-sm font-bold text-slate-700 mb-3">Bulk Import via Excel</h4>
                <p className="text-xs text-slate-500 mb-6 leading-relaxed">
-                 Upload an XLSX file with required sheets (Manufacturers, Finishes, etc.) to refresh the grounding engine.
+                 Upload an XLSX file with required sheets (Manufacturers, Finishes, etc.) to refresh the grounding engine with your local catalogue.
                </p>
              </div>
              <div className="flex gap-2">
@@ -151,7 +165,7 @@ export function ReferencePackAdmin({ referencePack, onReferencePackChange }: Pro
                  onChange={(e) => {
                    const file = e.target.files?.[0] || null;
                    setImportFile(file);
-                   console.log("File prepared for import:", file?.name);
+                   console.log("File ready:", file?.name);
                  }} 
                  className="flex-grow text-xs bg-white border border-slate-200 rounded-xl px-3 py-2.5 focus:ring-2 focus:ring-indigo-500/20"
                />
@@ -161,17 +175,17 @@ export function ReferencePackAdmin({ referencePack, onReferencePackChange }: Pro
                  className={`px-5 py-2.5 bg-indigo-600 text-white rounded-xl text-xs font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-500/20 disabled:opacity-50 flex items-center gap-2`}
                >
                  {isImporting ? <i className="fa-solid fa-circle-notch animate-spin"></i> : <i className="fa-solid fa-file-import"></i>}
-                 {isImporting ? 'Processing...' : 'Import'}
+                 {isImporting ? 'Parsing...' : 'Import'}
                </button>
              </div>
            </div>
 
            <div className="p-6 bg-indigo-50/30 rounded-3xl border border-indigo-100 flex flex-col justify-between">
              <div>
-               <label className="text-[10px] font-black text-indigo-400 uppercase tracking-widest block mb-1">Knowledge Archive</label>
-               <h4 className="text-sm font-bold text-slate-700 mb-3">Download KB for Verification</h4>
+               <label className="text-[10px] font-black text-indigo-400 uppercase tracking-widest block mb-1">Archive Management</label>
+               <h4 className="text-sm font-bold text-slate-700 mb-3">Download Catalogue Template</h4>
                <p className="text-xs text-slate-500 mb-6 leading-relaxed">
-                 Download the current reference pack as an organized Excel file to audit aliases and normalization logic.
+                 Download the current catalogue structure. This can be used as a template for your own Excel uploads.
                </p>
              </div>
              <button 
@@ -179,7 +193,7 @@ export function ReferencePackAdmin({ referencePack, onReferencePackChange }: Pro
                className="w-full px-5 py-3 bg-white border border-indigo-200 text-indigo-600 rounded-xl text-xs font-black hover:bg-indigo-600 hover:text-white transition-all shadow-md flex items-center justify-center gap-3 uppercase tracking-wider"
              >
                <i className="fa-solid fa-cloud-arrow-down text-base"></i>
-               Export Knowledge Base
+               Download Current Catalogue
              </button>
            </div>
         </div>
@@ -190,20 +204,20 @@ export function ReferencePackAdmin({ referencePack, onReferencePackChange }: Pro
           </div>
           <h3 className="text-white font-black text-lg mb-4 flex items-center gap-2">
             <i className="fa-solid fa-lightbulb text-amber-400"></i>
-            Grounding Best Practices
+            Import Debugging Tips
           </h3>
           <ul className="space-y-4 text-sm font-medium">
             <li className="flex gap-4">
               <span className="w-6 h-6 bg-white/10 rounded-lg flex items-center justify-center text-[10px] font-bold text-white shrink-0">1</span>
-              <p>Use <span className="text-white font-bold">Aliases</span> to map legacy terms (e.g., 'Satin Chrome' &rarr; 'US26D') to standard internal codes.</p>
+              <p>Check the <span className="text-white font-bold">Browser Console (F12)</span> for detailed logs showing which sheets were found.</p>
             </li>
             <li className="flex gap-4">
               <span className="w-6 h-6 bg-white/10 rounded-lg flex items-center justify-center text-[10px] font-bold text-white shrink-0">2</span>
-              <p>Ensure <span className="text-white font-bold">Manufacturers</span> have unique abbreviations (Prefixes) to prevent catalog collision.</p>
+              <p>Ensure your Sheet Names contain the expected keywords (e.g., a sheet named <span className="text-white font-bold">"Manufacturer List"</span> will match <span className="text-white font-bold">"Manufacturers"</span>).</p>
             </li>
             <li className="flex gap-4">
               <span className="w-6 h-6 bg-white/10 rounded-lg flex items-center justify-center text-[10px] font-bold text-white shrink-0">3</span>
-              <p>Keep <span className="text-white font-bold">Template IDs</span> consistent with your ERP system for automatic Hardware Set expansion.</p>
+              <p>Column headers should be in the <span className="text-white font-bold">First Row</span> of the sheet. Partial matches like "Mfr Name" for "Name" are supported.</p>
             </li>
           </ul>
         </div>

@@ -125,7 +125,7 @@ const App: React.FC = () => {
     const file = event.target.files?.[0];
     if (file) {
       setControlTemplateFile(file);
-      alert(`Template loaded: ${file.name}`);
+      alert(`Report Template loaded: ${file.name}`);
     }
   };
 
@@ -209,21 +209,21 @@ const App: React.FC = () => {
               className={`flex items-center gap-2 px-5 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'ops' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
             >
               <i className="fa-solid fa-microchip"></i>
-              Operations
+              Parse
             </button>
             <button 
               onClick={() => setActiveTab('policy')}
               className={`flex items-center gap-2 px-5 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'policy' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
             >
               <i className="fa-solid fa-shield-halved"></i>
-              Policy
+              Automation Policy
             </button>
             <button 
               onClick={() => setActiveTab('reference')}
               className={`flex items-center gap-2 px-5 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'reference' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
             >
               <i className="fa-solid fa-book"></i>
-              Knowledge
+              Input Catalogue
             </button>
           </nav>
 
@@ -231,18 +231,34 @@ const App: React.FC = () => {
             {activeTab === 'ops' ? (
               <>
                 <div className="hidden lg:flex items-center gap-2 bg-white border border-slate-200 px-3 py-1.5 rounded-xl shadow-sm">
-                  <button onClick={() => setActiveTab('reference')} className={`text-[10px] font-bold transition-all flex items-center gap-1.5 px-2 py-0.5 rounded-lg ${referencePack.manufacturers.length > 0 ? 'text-indigo-700 bg-indigo-50' : 'text-slate-500 bg-slate-50 hover:bg-slate-100'}`}>
+                  <button 
+                    onClick={() => setActiveTab('reference')} 
+                    className={`text-[10px] font-bold transition-all flex items-center gap-1.5 px-2 py-0.5 rounded-lg ${referencePack.manufacturers.length > 0 ? 'text-indigo-700 bg-indigo-50' : 'text-slate-500 bg-slate-50 hover:bg-slate-100'}`} 
+                    title="INPUT CATALOGUE: Your master database of manufacturers, finishes, and parts used for AI grounding."
+                  >
                     <i className={`fa-solid ${referencePack.manufacturers.length > 0 ? 'fa-book-bookmark' : 'fa-book'}`}></i>
-                    <span>{referencePack.manufacturers.length > 0 ? `KB v${referencePack.version}` : 'No KB'}</span>
+                    <span>{referencePack.manufacturers.length > 0 ? `Cat v${referencePack.version}` : 'No Catalogue'}</span>
+                    <i className="fa-solid fa-circle-info text-[9px] opacity-40 ml-0.5"></i>
                   </button>
-                  <button onClick={() => templateInputRef.current?.click()} className={`text-[10px] font-bold transition-all flex items-center gap-1.5 px-2 py-0.5 rounded-lg ${controlTemplateFile ? 'text-emerald-700 bg-emerald-50' : 'text-slate-500 bg-slate-50 hover:bg-slate-100'}`}>
+                  <button 
+                    onClick={() => templateInputRef.current?.click()} 
+                    className={`text-[10px] font-bold transition-all flex items-center gap-1.5 px-2 py-0.5 rounded-lg ${controlTemplateFile ? 'text-emerald-700 bg-emerald-50' : 'text-slate-500 bg-slate-50 hover:bg-slate-100'}`} 
+                    title="REPORT TEMPLATE: Upload an XLSX file to use as the base for exports. Data will be injected into sheet 'PO_LineItem_Analysis'."
+                  >
                     <i className={`fa-solid ${controlTemplateFile ? 'fa-file-circle-check' : 'fa-file-excel'}`}></i>
-                    <span>{controlTemplateFile ? 'Template OK' : 'Template'}</span>
+                    <span>{controlTemplateFile ? 'Report OK' : 'Report Template'}</span>
+                    <i className="fa-solid fa-circle-info text-[9px] opacity-40 ml-0.5"></i>
                   </button>
                   <div className="w-px h-4 bg-slate-100 mx-1"></div>
-                  <button onClick={reRouteExistingRows} disabled={rows.length === 0} className="text-[10px] font-bold text-blue-600 hover:bg-blue-50 px-2 py-0.5 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-30" title="Recalculate policy lanes for existing data">
+                  <button 
+                    onClick={reRouteExistingRows} 
+                    disabled={rows.length === 0} 
+                    className="text-[10px] font-bold text-blue-600 hover:bg-blue-50 px-2 py-0.5 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-30" 
+                    title="RE-RUN: Re-evaluates all items in the queue against the current active Policy and Input Catalogue rules."
+                  >
                     <i className="fa-solid fa-rotate"></i>
-                    <span>Re-Route</span>
+                    <span>Re-Run</span>
+                    <i className="fa-solid fa-circle-info text-[9px] opacity-40 ml-0.5"></i>
                   </button>
                   <input type="file" ref={templateInputRef} onChange={handleTemplateUpload} className="hidden" accept=".xlsx" />
                 </div>
@@ -252,7 +268,7 @@ const App: React.FC = () => {
                 </button>
                 <input type="file" ref={fileInputRef} onChange={(e) => e.target.files && processFiles(e.target.files)} className="hidden" multiple accept="application/pdf,image/*" />
                 <div className="flex items-center bg-white border border-slate-200 rounded-2xl p-1 gap-1 shadow-sm">
-                  <button onClick={handleExportControlSurfaceXlsx} disabled={rows.length === 0 || isProcessing} className="flex items-center gap-2 px-4 py-2 text-emerald-700 hover:bg-emerald-50 rounded-xl font-bold disabled:opacity-30 transition-all text-sm" title="Export to XLSX with Audit Columns">
+                  <button onClick={handleExportControlSurfaceXlsx} disabled={rows.length === 0 || isProcessing} className="flex items-center gap-2 px-4 py-2 text-emerald-700 hover:bg-emerald-50 rounded-xl font-bold disabled:opacity-30 transition-all text-sm" title="Export to XLSX using Report Template">
                     <i className="fa-solid fa-file-excel"></i>
                   </button>
                   <button onClick={handleExportCSV} disabled={rows.length === 0 || isProcessing} className="flex items-center gap-2 px-4 py-2 text-slate-700 hover:bg-slate-50 rounded-xl font-bold disabled:opacity-30 transition-all text-sm" title="Export to Audit CSV">
@@ -268,7 +284,7 @@ const App: React.FC = () => {
             ) : (
                 <div className="flex items-center gap-2 bg-emerald-50 px-4 py-2 rounded-2xl border border-emerald-100">
                   <i className="fa-solid fa-graduation-cap text-emerald-400 text-xs"></i>
-                  <span className="text-xs font-bold text-emerald-700">Master Knowledge Base: Manage manufacturers, finishes, and catalog standards.</span>
+                  <span className="text-xs font-bold text-emerald-700">Input Catalogue: Manage master manufacturers, finishes, and catalog standards.</span>
                </div>
             )}
           </div>
